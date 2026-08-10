@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Snell v6 manager for Alpine Linux 3.21-3.23
+# Snell v6 manager for Alpine Linux 3.19-3.23
 # POSIX /bin/sh compatible (BusyBox ash).
 #
 # Usage:
@@ -13,6 +13,10 @@ set -eu
 #   ./snell-v6-manager.sh psk [NEW_PSK]
 #   ./snell-v6-manager.sh mode default|unshaped|unsafe-raw
 #   ./snell-v6-manager.sh dns default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only
+#   ./snell-v6-manager.sh host <server_ip_or_domain>
+#   ./snell-v6-manager.sh local-dns show
+#   ./snell-v6-manager.sh local-dns set 1.1.1.1 8.8.8.8
+#   ./snell-v6-manager.sh local-dns restore
 #   ./snell-v6-manager.sh ipv6 on|off
 #   ./snell-v6-manager.sh restart|start|stop|status
 #   ./snell-v6-manager.sh logs
@@ -25,6 +29,7 @@ set -eu
 #   DNS_PREFERENCE=default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only
 #   ENABLE_IPV6=0|1
 #   SERVER_HOST=1.2.3.4_or_domain
+#   LOCAL_DNS="1.1.1.1 8.8.8.8"
 #   SNELL_URL=https://.../snell-server-v6...-linux-amd64.zip
 #   ALLOW_UNSAFE_RAW=1
 
@@ -33,6 +38,11 @@ CONF_FILE="${CONF_DIR}/snell-server.conf"
 BIN_FILE="/usr/local/bin/snell-server"
 INIT_FILE="/etc/init.d/snell"
 LOG_FILE="/var/log/snell.log"
+STATE_FILE="${CONF_DIR}/manager.conf"
+DNS_BACKUP_FILE="${CONF_DIR}/resolv.conf.backup"
+RESOLV_CONF="/etc/resolv.conf"
+UDHCPC_CONF="/etc/udhcpc/udhcpc.conf"
+UDHCPC_BACKUP_FILE="${CONF_DIR}/udhcpc.conf.backup"
 SERVICE_NAME="snell"
 RELEASE_PAGE="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
 
@@ -49,8 +59,8 @@ check_platform() {
   ALPINE_VERSION="$(cat /etc/alpine-release)"
   ALPINE_MINOR="$(printf '%s' "$ALPINE_VERSION" | awk -F. '{print $1"."$2}')"
   case "$ALPINE_MINOR" in
-    3.21|3.22|3.23) ;;
-    *) die "Unsupported Alpine version: ${ALPINE_VERSION}. Only 3.21, 3.22 and 3.23 are supported." ;;
+    3.19|3.20|3.21|3.22|3.23) ;;
+    *) die "Unsupported Alpine version: ${ALPINE_VERSION}. Only Alpine 3.19 through 3.23 are supported." ;;
   esac
 
   case "$(uname -m)" in
@@ -71,6 +81,266 @@ ensure_dependencies() {
 trim_value() {
   # Usage: trim_value "text"
   printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+state_get() {
+  key="$1"
+  [ -f "$STATE_FILE" ] || return 1
+  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$STATE_FILE"
+}
+
+state_set() {
+  key="$1"
+  value="$2"
+  mkdir -p "$CONF_DIR"
+  chmod 700 "$CONF_DIR"
+  umask 077
+  tmp="${STATE_FILE}.tmp.$$"
+  if [ -f "$STATE_FILE" ]; then
+    awk -F= -v key="$key" '$1 != key {print}' "$STATE_FILE" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+normalize_server_host() {
+  host="$(trim_value "$1")"
+  case "$host" in
+    \[*\]) host="${host#\[}"; host="${host%\]}" ;;
+  esac
+  printf '%s\n' "$host"
+}
+
+validate_ipv4() {
+  printf '%s\n' "$1" | awk -F. '
+    NF != 4 {ok=0; exit}
+    BEGIN {ok=1}
+    {
+      for (i=1; i<=4; i++) {
+        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) {ok=0; exit}
+      }
+    }
+    END {exit ok ? 0 : 1}
+  ' >/dev/null 2>&1
+}
+
+validate_server_host() {
+  host="$(normalize_server_host "$1")"
+  [ -n "$host" ] || return 1
+  case "$host" in
+    *[!A-Za-z0-9._:-]*|*..*|.*|*.) return 1 ;;
+  esac
+  case "$host" in
+    *:*)
+      case "$host" in *[!0-9A-Fa-f:.]*) return 1 ;; esac
+      ;;
+    *.*)
+      case "$host" in
+        *[!0-9.]*) : ;;
+        *) validate_ipv4 "$host" || return 1 ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
+current_server_host() {
+  if [ -n "${SERVER_HOST:-}" ]; then
+    normalize_server_host "$SERVER_HOST"
+  else
+    state_get SERVER_HOST 2>/dev/null || true
+  fi
+}
+
+set_server_host() {
+  host="$(normalize_server_host "$1")"
+  validate_server_host "$host" || die "Invalid server IP/domain: ${1}"
+  state_set SERVER_HOST "$host"
+  SERVER_HOST="$host"
+  export SERVER_HOST
+  log "Server address saved as ${host}."
+}
+
+ensure_server_host() {
+  host="$(current_server_host)"
+  if [ -n "$host" ]; then
+    validate_server_host "$host" || die "Saved SERVER_HOST is invalid: ${host}"
+    state_set SERVER_HOST "$host"
+    return 0
+  fi
+  if [ -t 0 ]; then
+    while :; do
+      printf 'Server IP or domain (used by clients to connect): '
+      read -r host || die "Unable to read server address."
+      if validate_server_host "$host"; then
+        set_server_host "$host"
+        return 0
+      fi
+      warn "Enter a valid IPv4, IPv6, or domain name without scheme or port."
+    done
+  fi
+  warn "SERVER_HOST is not set. Surge output will use YOUR_SERVER_IP until you run: $0 host <IP-or-domain>"
+}
+
+format_client_host() {
+  host="$1"
+  case "$host" in
+    *:*) printf '[%s]\n' "$host" ;;
+    *) printf '%s\n' "$host" ;;
+  esac
+}
+
+validate_dns_server() {
+  dns="$1"
+  [ -n "$dns" ] || return 1
+  case "$dns" in
+    *:*)
+      case "$dns" in *[!0-9A-Fa-f:.]*) return 1 ;; esac
+      return 0
+      ;;
+    *) validate_ipv4 "$dns" ;;
+  esac
+}
+
+backup_system_dns() {
+  mkdir -p "$CONF_DIR"
+  chmod 700 "$CONF_DIR"
+  if [ ! -f "$DNS_BACKUP_FILE" ]; then
+    if [ -e "$RESOLV_CONF" ]; then
+      cp -L "$RESOLV_CONF" "$DNS_BACKUP_FILE"
+    else
+      : > "$DNS_BACKUP_FILE"
+    fi
+    chmod 600 "$DNS_BACKUP_FILE"
+    log "Backed up current DNS to ${DNS_BACKUP_FILE}."
+  fi
+
+  if [ -z "$(state_get UDHCPC_CONF_EXISTED 2>/dev/null || true)" ]; then
+    if [ -f "$UDHCPC_CONF" ]; then
+      cp "$UDHCPC_CONF" "$UDHCPC_BACKUP_FILE"
+      chmod 600 "$UDHCPC_BACKUP_FILE"
+      state_set UDHCPC_CONF_EXISTED 1
+    else
+      state_set UDHCPC_CONF_EXISTED 0
+    fi
+  fi
+}
+
+disable_dhcp_dns_overwrite() {
+  mkdir -p "$(dirname "$UDHCPC_CONF")"
+  tmp="${CONF_DIR}/udhcpc.conf.new.$$"
+  if [ -f "$UDHCPC_CONF" ]; then
+    awk '!/^[[:space:]]*RESOLV_CONF[[:space:]]*=/' "$UDHCPC_CONF" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s\n' 'RESOLV_CONF="no"' >> "$tmp"
+  cat "$tmp" > "$UDHCPC_CONF"
+  chmod 644 "$UDHCPC_CONF"
+  rm -f "$tmp"
+}
+
+restore_udhcpc_dns_behavior() {
+  existed="$(state_get UDHCPC_CONF_EXISTED 2>/dev/null || true)"
+  case "$existed" in
+    1)
+      if [ -f "$UDHCPC_BACKUP_FILE" ]; then
+        cat "$UDHCPC_BACKUP_FILE" > "$UDHCPC_CONF"
+      fi
+      ;;
+    0)
+      if [ -f "$UDHCPC_CONF" ]; then
+        tmp="${CONF_DIR}/udhcpc.conf.restore.$$"
+        awk '!/^[[:space:]]*RESOLV_CONF[[:space:]]*=[[:space:]]*"?no"?[[:space:]]*$/' "$UDHCPC_CONF" > "$tmp"
+        cat "$tmp" > "$UDHCPC_CONF"
+        rm -f "$tmp"
+      fi
+      ;;
+  esac
+  rm -f "$UDHCPC_BACKUP_FILE"
+}
+
+show_system_dns() {
+  printf '\nCurrent Alpine system DNS (%s):\n' "$RESOLV_CONF"
+  if [ -r "$RESOLV_CONF" ]; then
+    found=0
+    while IFS= read -r dns; do
+      [ -n "$dns" ] || continue
+      printf '  - %s\n' "$dns"
+      found=1
+    done <<EOF_DNS
+$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' "$RESOLV_CONF")
+EOF_DNS
+    [ "$found" = "1" ] || printf '%s\n' '  (no nameserver entries)'
+  else
+    printf '%s\n' '  (unavailable)'
+  fi
+  if [ -f "$DNS_BACKUP_FILE" ]; then
+    printf 'Original DNS backup: %s\n' "$DNS_BACKUP_FILE"
+  else
+    printf '%s\n' 'Original DNS backup: none'
+  fi
+  if [ -f "$UDHCPC_CONF" ] && grep -Eq '^[[:space:]]*RESOLV_CONF[[:space:]]*=[[:space:]]*"?no"?' "$UDHCPC_CONF"; then
+    printf '%s\n' 'DHCP DNS overwrite: disabled (persistent static DNS)'
+  else
+    printf '%s\n' 'DHCP DNS overwrite: enabled / default'
+  fi
+}
+
+set_system_dns() {
+  [ "$#" -ge 1 ] || die "At least one DNS server is required."
+  [ "$#" -le 3 ] || die "Use at most 3 DNS servers."
+  for dns in "$@"; do
+    validate_dns_server "$dns" || die "Invalid DNS server IP: ${dns}"
+  done
+  backup_system_dns
+  disable_dhcp_dns_overwrite
+  tmp="${CONF_DIR}/resolv.conf.new.$$"
+  : > "$tmp"
+  for dns in "$@"; do
+    printf 'nameserver %s\n' "$dns" >> "$tmp"
+  done
+  if [ -r "$RESOLV_CONF" ]; then
+    awk '!/^[[:space:]]*nameserver[[:space:]]+/' "$RESOLV_CONF" >> "$tmp"
+  fi
+  cat "$tmp" > "$RESOLV_CONF"
+  rm -f "$tmp"
+  log "System DNS updated: $*"
+  log "Configured udhcpc not to overwrite /etc/resolv.conf, so the selected DNS persists across DHCP renewals/reboots."
+  show_system_dns
+}
+
+restore_system_dns() {
+  [ -f "$DNS_BACKUP_FILE" ] || die "No DNS backup is available to restore."
+  cat "$DNS_BACKUP_FILE" > "$RESOLV_CONF"
+  rm -f "$DNS_BACKUP_FILE"
+  restore_udhcpc_dns_behavior
+  log "Original system DNS and DHCP DNS behavior restored."
+  show_system_dns
+}
+
+configure_system_dns_on_install() {
+  if [ -n "${LOCAL_DNS:-}" ]; then
+    set -- $LOCAL_DNS
+    set_system_dns "$@"
+    return 0
+  fi
+  [ -t 0 ] || return 0
+  printf 'Set Alpine local DNS now? [y/N]: '
+  read -r answer || return 0
+  case "$answer" in
+    y|Y|yes|YES)
+      printf 'DNS server IPs (space separated, max 3; e.g. 1.1.1.1 8.8.8.8): '
+      read -r dns_line || return 0
+      [ -n "$(trim_value "$dns_line")" ] || { warn "No DNS entered; skipped."; return 0; }
+      set -- $dns_line
+      set_system_dns "$@"
+      ;;
+    *) log "Keeping current Alpine system DNS." ;;
+  esac
 }
 
 conf_get() {
@@ -339,7 +609,13 @@ installed_version() {
 }
 
 install_snell() {
+  first_install=0
+  config_exists || first_install=1
   ensure_dependencies
+  ensure_server_host
+  if [ "$first_install" = "1" ]; then
+    configure_system_dns_on_install
+  fi
   create_initial_config
   tmp_bin="${BIN_FILE}.new.$$"
   backup_bin="${BIN_FILE}.bak.$$"
@@ -552,7 +828,11 @@ show_config() {
   mode="$(conf_get mode 2>/dev/null || printf 'default')"
   port="$(current_port 2>/dev/null || true)"
   version="$(installed_version 2>/dev/null || true)"
-  host="${SERVER_HOST:-YOUR_SERVER_IP}"
+  host="$(current_server_host)"
+  [ -n "$host" ] || host="YOUR_SERVER_IP"
+  client_host="$(format_client_host "$host")"
+  system_dns="$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {if (out != "") out=out ", "; out=out $2} END {print out}' "$RESOLV_CONF" 2>/dev/null || true)"
+  [ -n "$system_dns" ] || system_dns="none"
 
   if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
     svc_status="running"
@@ -569,13 +849,15 @@ show_config() {
   printf 'Service:      %s\n' "$svc_status"
   printf 'Listen:       %s\n' "$listen"
   printf 'PSK:          %s\n' "$psk"
-  printf 'DNS:          %s\n' "$dns_pref"
+  printf 'Server:       %s\n' "$host"
+  printf 'DNS pref:     %s\n' "$dns_pref"
+  printf 'Alpine DNS:   %s\n' "$system_dns"
   printf 'Mode:         %s\n' "$mode"
   printf 'Config:       %s\n' "$CONF_FILE"
   printf 'Log:          %s\n' "$LOG_FILE"
   if [ -n "$port" ]; then
     printf '\nSurge configuration:\n'
-    printf 'Snell-v6 = snell, %s, %s, psk=%s, version=6' "$host" "$port" "$psk"
+    printf 'Snell-v6 = snell, %s, %s, psk=%s, version=6' "$client_host" "$port" "$psk"
     if [ "$mode" != "default" ]; then
       printf ', mode=%s' "$mode"
     fi
@@ -614,6 +896,10 @@ uninstall_snell() {
     rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
     rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
   fi
+  if [ -f "$DNS_BACKUP_FILE" ]; then
+    warn "Restoring the DNS configuration saved before Snell manager changed it."
+    restore_system_dns || true
+  fi
   rm -f "$INIT_FILE" "$BIN_FILE" "${BIN_FILE}.version" "$LOG_FILE"
   rm -rf "$CONF_DIR"
   log "Snell has been uninstalled."
@@ -621,7 +907,7 @@ uninstall_snell() {
 
 print_help() {
   cat <<EOF_HELP
-Snell v6 manager for Alpine 3.21-3.23
+Snell v6 manager for Alpine 3.19-3.23
 
 Usage:
   $0                       Interactive menu
@@ -631,7 +917,11 @@ Usage:
   $0 port <1-65535>        Change listen port
   $0 psk [new_psk]         Reset PSK (random if omitted)
   $0 mode <mode>           default | unshaped | unsafe-raw
-  $0 dns <preference>      default | prefer-ipv4 | prefer-ipv6 | ipv4-only | ipv6-only
+  $0 dns <preference>      Snell DNS preference: default | prefer-ipv4 | prefer-ipv6 | ipv4-only | ipv6-only
+  $0 host <IP-or-domain>   Save/change the public IP or domain used in Surge output
+  $0 local-dns show        Show Alpine /etc/resolv.conf DNS servers
+  $0 local-dns set <IP...> Set 1-3 Alpine system DNS server IPs
+  $0 local-dns restore     Restore DNS backed up before the first change
   $0 ipv6 on|off           Enable/disable IPv6 listening
   $0 start|stop|restart    Control service
   $0 status                Show OpenRC service status
@@ -640,7 +930,7 @@ Usage:
   $0 help                  Show this help
 
 Install environment variables:
-  PORT, PSK, MODE, DNS_PREFERENCE, ENABLE_IPV6, SERVER_HOST, SNELL_URL
+  PORT, PSK, MODE, DNS_PREFERENCE, ENABLE_IPV6, SERVER_HOST, LOCAL_DNS, SNELL_URL
 EOF_HELP
 }
 
@@ -653,7 +943,7 @@ interactive_menu() {
   while :; do
     clear 2>/dev/null || true
     printf '%s\n' '========================================'
-    printf '%s\n' ' Snell v6 Manager - Alpine 3.21-3.23'
+    printf '%s\n' ' Snell v6 Manager - Alpine 3.19-3.23'
     printf '%s\n' '========================================'
     if binary_exists; then
       ver="$(installed_version 2>/dev/null || true)"
@@ -670,15 +960,17 @@ interactive_menu() {
     printf '%s\n' '1) Install / repair'
     printf '%s\n' '2) Update Snell v6'
     printf '%s\n' '3) Show configuration'
-    printf '%s\n' '4) Change port'
-    printf '%s\n' '5) Reset PSK'
-    printf '%s\n' '6) Change mode'
-    printf '%s\n' '7) Change DNS preference'
-    printf '%s\n' '8) Toggle IPv6 listening'
-    printf '%s\n' '9) Restart service'
-    printf '%s\n' '10) Show status'
-    printf '%s\n' '11) Show logs'
-    printf '%s\n' '12) Uninstall'
+    printf '%s\n' '4) Change server IP / domain'
+    printf '%s\n' '5) Change port'
+    printf '%s\n' '6) Reset PSK'
+    printf '%s\n' '7) Change mode'
+    printf '%s\n' '8) Change Snell DNS preference'
+    printf '%s\n' '9) Set / restore Alpine local DNS'
+    printf '%s\n' '10) Toggle IPv6 listening'
+    printf '%s\n' '11) Restart service'
+    printf '%s\n' '12) Show status'
+    printf '%s\n' '13) Show logs'
+    printf '%s\n' '14) Uninstall'
     printf '%s\n' '0) Exit'
     printf '%s\n' '========================================'
     printf 'Select: '
@@ -689,18 +981,25 @@ interactive_menu() {
       2) update_snell; pause_menu ;;
       3) show_config; pause_menu ;;
       4)
+        printf 'Server IP or domain: '
+        read -r new_host
+        set_server_host "$new_host"
+        show_config
+        pause_menu
+        ;;
+      5)
         printf 'New port: '
         read -r new_port
         change_port "$new_port"
         pause_menu
         ;;
-      5)
+      6)
         printf 'New PSK (leave blank for random): '
         read -r new_psk
         change_psk "$new_psk"
         pause_menu
         ;;
-      6)
+      7)
         printf 'Mode [default/unshaped/unsafe-raw]: '
         read -r new_mode
         if [ "$new_mode" = "unsafe-raw" ]; then
@@ -716,13 +1015,27 @@ interactive_menu() {
         fi
         pause_menu
         ;;
-      7)
-        printf 'DNS [default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only]: '
+      8)
+        printf 'Snell DNS preference [default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only]: '
         read -r new_dns
         change_dns "$new_dns"
         pause_menu
         ;;
-      8)
+      9)
+        show_system_dns
+        printf 'Enter DNS IPs separated by spaces, or type restore (blank = cancel): '
+        read -r dns_line
+        case "$(trim_value "$dns_line")" in
+          '') log "Cancelled." ;;
+          restore|RESTORE) restore_system_dns ;;
+          *)
+            set -- $dns_line
+            set_system_dns "$@"
+            ;;
+        esac
+        pause_menu
+        ;;
+      10)
         if [ "$(current_ipv6_enabled 2>/dev/null || printf 0)" = "1" ]; then
           toggle_ipv6 off
         else
@@ -730,10 +1043,10 @@ interactive_menu() {
         fi
         pause_menu
         ;;
-      9) service_action restart; pause_menu ;;
-      10) service_action status || true; pause_menu ;;
-      11) show_logs; pause_menu ;;
-      12) uninstall_snell; pause_menu ;;
+      11) service_action restart; pause_menu ;;
+      12) service_action status || true; pause_menu ;;
+      13) show_logs; pause_menu ;;
+      14) uninstall_snell; pause_menu ;;
       0) return 0 ;;
       *) warn "Invalid selection."; pause_menu ;;
     esac
@@ -773,6 +1086,24 @@ main() {
     dns)
       [ $# -ge 2 ] || die "Usage: $0 dns default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only"
       change_dns "$2"
+      ;;
+    host)
+      [ $# -ge 2 ] || die "Usage: $0 host <server-ip-or-domain>"
+      set_server_host "$2"
+      if config_exists; then show_config; fi
+      ;;
+    local-dns)
+      [ $# -ge 2 ] || die "Usage: $0 local-dns show|set <DNS-IP...>|restore"
+      case "$2" in
+        show) show_system_dns ;;
+        set)
+          [ $# -ge 3 ] || die "Usage: $0 local-dns set <DNS-IP...>"
+          shift 2
+          set_system_dns "$@"
+          ;;
+        restore) restore_system_dns ;;
+        *) die "Usage: $0 local-dns show|set <DNS-IP...>|restore" ;;
+      esac
       ;;
     ipv6)
       [ $# -ge 2 ] || die "Usage: $0 ipv6 on|off"

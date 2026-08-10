@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Snell v6 manager for Alpine Linux 3.19-3.23 (TFO + interactive port)
+# Snell v6 manager for Alpine Linux
 # POSIX /bin/sh compatible (BusyBox ash).
 #
 # Usage:
@@ -58,25 +58,40 @@ require_root() {
 
 check_platform() {
   [ -f /etc/alpine-release ] || die "This script only supports Alpine Linux."
-  ALPINE_VERSION="$(cat /etc/alpine-release)"
-  ALPINE_MINOR="$(printf '%s' "$ALPINE_VERSION" | awk -F. '{print $1"."$2}')"
-  case "$ALPINE_MINOR" in
-    3.19|3.20|3.21|3.22|3.23) ;;
-    *) die "Unsupported Alpine version: ${ALPINE_VERSION}. Only Alpine 3.19 through 3.23 are supported." ;;
-  esac
+  command -v apk >/dev/null 2>&1 || die "apk was not found; this does not look like a usable Alpine Linux system."
 
+  ALPINE_VERSION="$(cat /etc/alpine-release 2>/dev/null || true)"
+  [ -n "$ALPINE_VERSION" ] || ALPINE_VERSION="unknown"
+
+  # Deliberately do not whitelist Alpine release numbers. Future and older
+  # releases are accepted and actual compatibility is checked at runtime.
   case "$(uname -m)" in
     x86_64) SNELL_ARCH="amd64" ;;
     aarch64|arm64) SNELL_ARCH="aarch64" ;;
     i386|i486|i586|i686) SNELL_ARCH="i386" ;;
-    *) die "Unsupported CPU architecture: $(uname -m)" ;;
+    *) die "Unsupported CPU architecture: $(uname -m). Snell v6 Linux binaries are expected for amd64, aarch64, or i386." ;;
   esac
 }
 
 ensure_dependencies() {
-  log "Installing/checking dependencies..."
-  apk update
-  apk add --no-cache ca-certificates curl unzip openssl gcompat iproute2
+  log "Installing/checking dependencies on Alpine ${ALPINE_VERSION}..."
+  apk update || die "apk update failed. Check /etc/apk/repositories and network connectivity."
+
+  # Keep the base dependency set conservative so this also works on older
+  # Alpine branches. OpenRC is installed explicitly for minimal VPS images.
+  apk add --no-cache ca-certificates curl unzip openssl iproute2 openrc     || die "Unable to install required Alpine packages."
+
+  # Snell's Linux binary expects glibc-compatible APIs. Prefer gcompat on
+  # modern Alpine. Older branches may only have libc6-compat in enabled repos.
+  if apk add --no-cache gcompat >/dev/null 2>&1; then
+    GLIBC_COMPAT="gcompat"
+  elif apk add --no-cache libc6-compat >/dev/null 2>&1; then
+    GLIBC_COMPAT="libc6-compat"
+    warn "gcompat is unavailable; using libc6-compat as a best-effort fallback."
+  else
+    die "Neither gcompat nor libc6-compat could be installed. Enable the appropriate Alpine repositories or use a newer Alpine release."
+  fi
+
   update-ca-certificates >/dev/null 2>&1 || true
 }
 
@@ -638,7 +653,7 @@ download_binary_to() {
   if ! check_binary_compat "$destination"; then
     rm -f "$destination"
     rm -rf "$tmp_dir"
-    die "The Snell binary could not run through Alpine's gcompat layer."
+    die "The Snell binary could not run with Alpine ${ALPINE_VERSION} and the available glibc compatibility layer (${GLIBC_COMPAT:-unknown})."
   fi
   rm -rf "$tmp_dir"
   printf '%s\n' "$version" > "${destination}.version"
@@ -1004,7 +1019,7 @@ uninstall_snell() {
 
 print_help() {
   cat <<EOF_HELP
-Snell v6 manager for Alpine 3.19-3.23
+Snell v6 manager for Alpine Linux (no hard version limit)
 
 Usage:
   $0                       Interactive menu
@@ -1041,7 +1056,7 @@ interactive_menu() {
   while :; do
     clear 2>/dev/null || true
     printf '%s\n' '========================================'
-    printf '%s\n' ' Snell v6 Manager - Alpine 3.19-3.23'
+    printf ' Snell v6 Manager - Alpine %s\n' "${ALPINE_VERSION:-unknown}"
     printf '%s\n' '========================================'
     if binary_exists; then
       ver="$(installed_version 2>/dev/null || true)"

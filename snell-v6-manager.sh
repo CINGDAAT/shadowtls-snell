@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Snell v6 manager for Alpine Linux 3.19-3.23
+# Snell v6 manager for Alpine Linux 3.19-3.23 (TFO + interactive port)
 # POSIX /bin/sh compatible (BusyBox ash).
 #
 # Usage:
@@ -18,6 +18,7 @@ set -eu
 #   ./snell-v6-manager.sh local-dns set 1.1.1.1 8.8.8.8
 #   ./snell-v6-manager.sh local-dns restore
 #   ./snell-v6-manager.sh ipv6 on|off
+#   ./snell-v6-manager.sh tfo on|off
 #   ./snell-v6-manager.sh restart|start|stop|status
 #   ./snell-v6-manager.sh logs
 #   ./snell-v6-manager.sh uninstall [--yes]
@@ -29,6 +30,7 @@ set -eu
 #   DNS_PREFERENCE=default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only
 #   ENABLE_IPV6=0|1
 #   SERVER_HOST=1.2.3.4_or_domain
+#   CLIENT_TFO=0|1
 #   LOCAL_DNS="1.1.1.1 8.8.8.8"
 #   SNELL_URL=https://.../snell-server-v6...-linux-amd64.zip
 #   ALLOW_UNSAFE_RAW=1
@@ -398,6 +400,88 @@ random_psk() {
   openssl rand -hex 16
 }
 
+configure_port_on_install() {
+  if [ -n "${PORT:-}" ]; then
+    validate_port "$PORT" || die "PORT must be an integer from 1 to 65535."
+    port_in_use "$PORT" && die "TCP port ${PORT} is already in use."
+    return 0
+  fi
+
+  [ -t 0 ] || return 0
+  suggested_port="$(random_port)"
+  while :; do
+    printf 'Listen port [%s]: ' "$suggested_port"
+    read -r selected_port || die "Unable to read listen port."
+    selected_port="$(trim_value "$selected_port")"
+    [ -n "$selected_port" ] || selected_port="$suggested_port"
+    if ! validate_port "$selected_port"; then
+      warn "Enter a port from 1 to 65535."
+      continue
+    fi
+    if port_in_use "$selected_port"; then
+      warn "TCP port ${selected_port} is already in use."
+      continue
+    fi
+    PORT="$selected_port"
+    export PORT
+    log "Listen port selected: ${PORT}."
+    return 0
+  done
+}
+
+validate_tfo_state() {
+  case "$1" in
+    1|on|enable|enabled|true|yes) return 0 ;;
+    0|off|disable|disabled|false|no) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_tfo_state() {
+  case "$1" in
+    1|on|enable|enabled|true|yes) printf '1\n' ;;
+    0|off|disable|disabled|false|no) printf '0\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+current_client_tfo() {
+  if [ -n "${CLIENT_TFO:-}" ]; then
+    normalize_tfo_state "$CLIENT_TFO" 2>/dev/null || printf '0\n'
+    return 0
+  fi
+  saved="$(state_get CLIENT_TFO 2>/dev/null || true)"
+  [ -n "$saved" ] || saved=0
+  normalize_tfo_state "$saved" 2>/dev/null || printf '0\n'
+}
+
+set_client_tfo() {
+  state="$(normalize_tfo_state "$1" 2>/dev/null || true)"
+  [ -n "$state" ] || die "Use: tfo on|off"
+  state_set CLIENT_TFO "$state"
+  CLIENT_TFO="$state"
+  export CLIENT_TFO
+  if [ "$state" = "1" ]; then
+    log "Surge TCP Fast Open (TFO) enabled for generated client configuration."
+  else
+    log "Surge TCP Fast Open (TFO) disabled for generated client configuration."
+  fi
+}
+
+configure_tfo_on_install() {
+  if [ -n "${CLIENT_TFO:-}" ]; then
+    set_client_tfo "$CLIENT_TFO"
+    return 0
+  fi
+  [ -t 0 ] || { state_set CLIENT_TFO 0; return 0; }
+  printf 'Enable Surge TCP Fast Open (TFO)? [y/N]: '
+  read -r answer || answer=''
+  case "$answer" in
+    y|Y|yes|YES) set_client_tfo 1 ;;
+    *) set_client_tfo 0 ;;
+  esac
+}
+
 validate_mode() {
   case "$1" in
     default|unshaped) return 0 ;;
@@ -614,7 +698,11 @@ install_snell() {
   ensure_dependencies
   ensure_server_host
   if [ "$first_install" = "1" ]; then
+    configure_port_on_install
     configure_system_dns_on_install
+    configure_tfo_on_install
+  elif [ -n "${CLIENT_TFO:-}" ]; then
+    set_client_tfo "$CLIENT_TFO"
   fi
   create_initial_config
   tmp_bin="${BIN_FILE}.new.$$"
@@ -826,6 +914,7 @@ show_config() {
   psk="$(conf_get psk)"
   dns_pref="$(conf_get dns-ip-preference 2>/dev/null || printf 'default')"
   mode="$(conf_get mode 2>/dev/null || printf 'default')"
+  tfo="$(current_client_tfo)"
   port="$(current_port 2>/dev/null || true)"
   version="$(installed_version 2>/dev/null || true)"
   host="$(current_server_host)"
@@ -853,6 +942,11 @@ show_config() {
   printf 'DNS pref:     %s\n' "$dns_pref"
   printf 'Alpine DNS:   %s\n' "$system_dns"
   printf 'Mode:         %s\n' "$mode"
+  if [ "$tfo" = "1" ]; then
+    printf '%s\n' 'Surge TFO:    enabled'
+  else
+    printf '%s\n' 'Surge TFO:    disabled'
+  fi
   printf 'Config:       %s\n' "$CONF_FILE"
   printf 'Log:          %s\n' "$LOG_FILE"
   if [ -n "$port" ]; then
@@ -860,6 +954,9 @@ show_config() {
     printf 'Snell-v6 = snell, %s, %s, psk=%s, version=6' "$client_host" "$port" "$psk"
     if [ "$mode" != "default" ]; then
       printf ', mode=%s' "$mode"
+    fi
+    if [ "$tfo" = "1" ]; then
+      printf '%s' ', tfo=true'
     fi
     printf '\n'
   fi
@@ -923,6 +1020,7 @@ Usage:
   $0 local-dns set <IP...> Set 1-3 Alpine system DNS server IPs
   $0 local-dns restore     Restore DNS backed up before the first change
   $0 ipv6 on|off           Enable/disable IPv6 listening
+  $0 tfo on|off            Enable/disable Surge client TCP Fast Open output
   $0 start|stop|restart    Control service
   $0 status                Show OpenRC service status
   $0 logs                  Show last 100 log lines
@@ -930,7 +1028,7 @@ Usage:
   $0 help                  Show this help
 
 Install environment variables:
-  PORT, PSK, MODE, DNS_PREFERENCE, ENABLE_IPV6, SERVER_HOST, LOCAL_DNS, SNELL_URL
+  PORT, PSK, MODE, DNS_PREFERENCE, ENABLE_IPV6, SERVER_HOST, LOCAL_DNS, CLIENT_TFO, SNELL_URL
 EOF_HELP
 }
 
@@ -966,11 +1064,12 @@ interactive_menu() {
     printf '%s\n' '7) Change mode'
     printf '%s\n' '8) Change Snell DNS preference'
     printf '%s\n' '9) Set / restore Alpine local DNS'
-    printf '%s\n' '10) Toggle IPv6 listening'
-    printf '%s\n' '11) Restart service'
-    printf '%s\n' '12) Show status'
-    printf '%s\n' '13) Show logs'
-    printf '%s\n' '14) Uninstall'
+    printf '%s\n' '10) Toggle Surge TCP Fast Open (TFO)'
+    printf '%s\n' '11) Toggle IPv6 listening'
+    printf '%s\n' '12) Restart service'
+    printf '%s\n' '13) Show status'
+    printf '%s\n' '14) Show logs'
+    printf '%s\n' '15) Uninstall'
     printf '%s\n' '0) Exit'
     printf '%s\n' '========================================'
     printf 'Select: '
@@ -1036,6 +1135,15 @@ interactive_menu() {
         pause_menu
         ;;
       10)
+        if [ "$(current_client_tfo)" = "1" ]; then
+          set_client_tfo off
+        else
+          set_client_tfo on
+        fi
+        if config_exists; then show_config; fi
+        pause_menu
+        ;;
+      11)
         if [ "$(current_ipv6_enabled 2>/dev/null || printf 0)" = "1" ]; then
           toggle_ipv6 off
         else
@@ -1043,10 +1151,10 @@ interactive_menu() {
         fi
         pause_menu
         ;;
-      11) service_action restart; pause_menu ;;
-      12) service_action status || true; pause_menu ;;
-      13) show_logs; pause_menu ;;
-      14) uninstall_snell; pause_menu ;;
+      12) service_action restart; pause_menu ;;
+      13) service_action status || true; pause_menu ;;
+      14) show_logs; pause_menu ;;
+      15) uninstall_snell; pause_menu ;;
       0) return 0 ;;
       *) warn "Invalid selection."; pause_menu ;;
     esac
@@ -1108,6 +1216,11 @@ main() {
     ipv6)
       [ $# -ge 2 ] || die "Usage: $0 ipv6 on|off"
       toggle_ipv6 "$2"
+      ;;
+    tfo)
+      [ $# -ge 2 ] || die "Usage: $0 tfo on|off"
+      set_client_tfo "$2"
+      if config_exists; then show_config; fi
       ;;
     start|stop|restart|status)
       service_action "$cmd"

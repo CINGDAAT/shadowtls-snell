@@ -34,7 +34,7 @@ set -eu
 #   CLIENT_TFO=0|1
 #   SHADOWTLS_ENABLE=0|1            # Snell v5 only
 #   SHADOWTLS_PORT=8443             # public TCP port
-#   SHADOWTLS_SNI=www.microsoft.com
+#   SHADOWTLS_SNI=www.icloud.com
 #   SHADOWTLS_PASSWORD=...
 #   SHADOWTLS_URL=https://github.com/ihciah/shadow-tls/releases/download/...
 #   LOCAL_DNS="1.1.1.1 8.8.8.8"
@@ -61,6 +61,7 @@ SHADOWTLS_SERVICE="shadowtls-snell"
 SHADOWTLS_RELEASE_API="https://api.github.com/repos/ihciah/shadow-tls/releases/latest"
 SHADOWTLS_LATEST_PAGE="https://github.com/ihciah/shadow-tls/releases/latest"
 SHADOWTLS_FALLBACK_VERSION="v0.2.25"
+DEFAULT_SHADOWTLS_SNI="www.icloud.com"
 
 log() { printf '%s\n' "[snell] $*"; }
 warn() { printf '%s\n' "[snell] WARNING: $*" >&2; }
@@ -815,7 +816,7 @@ configure_shadowtls_on_install() {
   fi
 
   sni="${SHADOWTLS_SNI:-$(current_shadowtls_sni)}"
-  [ -n "$sni" ] || sni="www.microsoft.com"
+  [ -n "$sni" ] || sni="$DEFAULT_SHADOWTLS_SNI"
   if [ -t 0 ] && [ -z "${SHADOWTLS_SNI:-}" ]; then
     while :; do
       printf 'ShadowTLS SNI [%s]: ' "$sni"
@@ -823,7 +824,7 @@ configure_shadowtls_on_install() {
       selected_sni="$(trim_value "$selected_sni")"
       [ -n "$selected_sni" ] || selected_sni="$sni"
       if validate_shadowtls_sni "$selected_sni"; then sni="$selected_sni"; break; fi
-      warn "Enter a hostname such as www.microsoft.com."
+      warn "Enter a hostname such as www.icloud.com."
     done
   fi
 

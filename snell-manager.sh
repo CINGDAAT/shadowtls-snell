@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Snell v5/v6 manager for Alpine Linux
+# Snell v5/v6 manager for Alpine Linux (version-agnostic; ShadowTLS v3 + safe QUIC handling + TFO)
 # POSIX /bin/sh compatible (BusyBox ash).
 #
 # Usage:
@@ -36,7 +36,7 @@ set -eu
 #   SHADOWTLS_PORT=8443             # public TCP port
 #   SHADOWTLS_SNI=www.icloud.com
 #   SHADOWTLS_PASSWORD=...
-#   SHADOWTLS_URL=https://github.com/ihciah/shadow-tls/releases/download/...
+#   SHADOWTLS_URL=https://github.com/ihciah/shadow-tls/releases/download/...  # optional manual override; otherwise latest is resolved automatically
 #   LOCAL_DNS="1.1.1.1 8.8.8.8"
 #   SNELL_VERSION=5|6
 #   SNELL_URL=https://.../snell-server-v5-or-v6...-linux-amd64.zip
@@ -60,7 +60,7 @@ SHADOWTLS_LOG="/var/log/shadowtls-snell.log"
 SHADOWTLS_SERVICE="shadowtls-snell"
 SHADOWTLS_RELEASE_API="https://api.github.com/repos/ihciah/shadow-tls/releases/latest"
 SHADOWTLS_LATEST_PAGE="https://github.com/ihciah/shadow-tls/releases/latest"
-SHADOWTLS_FALLBACK_VERSION="v0.2.25"
+SHADOWTLS_LATEST_DOWNLOAD_BASE="https://github.com/ihciah/shadow-tls/releases/latest/download"
 DEFAULT_SHADOWTLS_SNI="www.icloud.com"
 
 log() { printf '%s\n' "[snell] $*"; }
@@ -672,11 +672,7 @@ get_shadowtls_latest_version() {
     effective="$(curl -fsSL --retry 2 --connect-timeout 10 -o /dev/null -w '%{url_effective}' "$SHADOWTLS_LATEST_PAGE" 2>/dev/null || true)"
     version="$(printf '%s' "$effective" | sed -n 's#.*/tag/##p')"
   fi
-  if [ -z "$version" ]; then
-    warn "Unable to resolve the latest ShadowTLS release; using fallback ${SHADOWTLS_FALLBACK_VERSION}."
-    version="$SHADOWTLS_FALLBACK_VERSION"
-  fi
-  printf '%s\n' "$version"
+  [ -n "$version" ] && printf '%s\n' "$version"
 }
 
 resolve_shadowtls_url() {
@@ -685,11 +681,24 @@ resolve_shadowtls_url() {
   else
     target="$(shadowtls_arch_target 2>/dev/null || true)"
     [ -n "$target" ] || die "ShadowTLS prebuilt binaries used by this script are not available for ${SNELL_ARCH}. Snell v5 itself may still work without ShadowTLS."
-    version="$(get_shadowtls_latest_version)"
-    url="https://github.com/ihciah/shadow-tls/releases/download/${version}/shadow-tls-${target}"
+    asset="shadow-tls-${target}"
+
+    # Prefer the exact asset URL returned by GitHub's official latest-release API.
+    # This avoids pinning a ShadowTLS software version in the manager script.
+    release_json="$(curl -fsSL --retry 2 --connect-timeout 10 "$SHADOWTLS_RELEASE_API" 2>/dev/null || true)"
+    url="$(printf '%s\n' "$release_json" \
+      | grep -E '"browser_download_url"[[:space:]]*:' \
+      | grep "/${asset}\"" \
+      | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | head -n 1 || true)"
+
+    # GitHub also provides a stable latest/download route. Use it if the API is
+    # rate-limited or temporarily unavailable; it still resolves to latest.
+    [ -n "$url" ] || url="${SHADOWTLS_LATEST_DOWNLOAD_BASE}/${asset}"
   fi
   case "$url" in
-    https://github.com/ihciah/shadow-tls/releases/download/*/shadow-tls-*) ;;
+    https://github.com/ihciah/shadow-tls/releases/download/*/shadow-tls-*|\
+    https://github.com/ihciah/shadow-tls/releases/latest/download/shadow-tls-*) ;;
     *) die "Refusing unexpected ShadowTLS URL: ${url}. Use an official ihciah/shadow-tls GitHub release URL." ;;
   esac
   printf '%s\n' "$url"
@@ -697,19 +706,40 @@ resolve_shadowtls_url() {
 
 download_shadowtls_binary() {
   url="$(resolve_shadowtls_url)"
-  log "Downloading ShadowTLS: ${url}"
+  log "Downloading latest ShadowTLS release asset: ${url}"
   tmp="${SHADOWTLS_BIN}.new.$$"
-  rm -f "$tmp"
-  curl -fL --retry 3 --connect-timeout 10 "$url" -o "$tmp" || { rm -f "$tmp"; die "Failed to download ShadowTLS."; }
-  [ -s "$tmp" ] || { rm -f "$tmp"; die "Downloaded ShadowTLS binary is empty."; }
+  effective_file="${tmp}.effective-url"
+  rm -f "$tmp" "$effective_file"
+  if ! curl -fL --retry 3 --connect-timeout 10 -o "$tmp" -w '%{url_effective}' "$url" > "$effective_file"; then
+    rm -f "$tmp" "$effective_file"
+    die "Failed to download ShadowTLS from the official latest release."
+  fi
+  [ -s "$tmp" ] || { rm -f "$tmp" "$effective_file"; die "Downloaded ShadowTLS binary is empty."; }
   chmod 755 "$tmp"
-  if ! "$tmp" --help >/dev/null 2>&1 && ! "$tmp" server --help >/dev/null 2>&1; then
-    rm -f "$tmp"
+
+  help_output="$("$tmp" --help 2>&1 || true)"
+  if [ -z "$help_output" ]; then
+    help_output="$("$tmp" server --help 2>&1 || true)"
+  fi
+  if [ -z "$help_output" ]; then
+    rm -f "$tmp" "$effective_file"
     die "Downloaded ShadowTLS binary cannot run on this Alpine/CPU."
   fi
+  if ! printf '%s\n' "$help_output" | grep -q -- '--v3'; then
+    rm -f "$tmp" "$effective_file"
+    die "The latest ShadowTLS binary does not advertise --v3 support; refusing to install it for this V3 configuration."
+  fi
+
+  effective_url="$(cat "$effective_file" 2>/dev/null || true)"
   mv "$tmp" "$SHADOWTLS_BIN"
-  release="$(printf '%s' "$url" | sed -n 's#.*/releases/download/\([^/]*\)/.*#\1#p')"
-  [ -n "$release" ] && state_set SHADOWTLS_RELEASE "$release" || true
+  rm -f "$effective_file"
+  release="$(printf '%s' "$effective_url" | sed -n 's#.*/releases/download/\([^/]*\)/.*#\1#p')"
+  if [ -z "$release" ]; then
+    release="$(get_shadowtls_latest_version 2>/dev/null || true)"
+  fi
+  [ -n "$release" ] && state_set SHADOWTLS_RELEASE "$release" || state_set SHADOWTLS_RELEASE latest
+  state_set SHADOWTLS_PROTOCOL 3
+  log "ShadowTLS installed: release ${release:-latest}, protocol V3."
 }
 
 current_shadowtls_port() { state_get SHADOWTLS_PORT 2>/dev/null || true; }

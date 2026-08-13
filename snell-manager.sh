@@ -13,6 +13,8 @@ snell_dir="/etc/snell/"
 snell_bin="/usr/local/bin/snell-server"
 snell_conf="/etc/snell/config.conf"
 snell_version_file="/etc/snell/ver.txt"
+# 管理脚本快捷命令：安装后可直接输入 snell 打开本菜单
+snell_manager_cmd="/usr/local/bin/snell"
 
 # ShadowTLS（作为 Snell 的 TCP 前置层）
 shadowtls_dir="/etc/shadow-tls"
@@ -95,6 +97,41 @@ confVersion(){
 			exit
 		}
 	' "${snell_conf}" 2>/dev/null
+}
+
+# 安装/刷新 snell 快捷命令。
+# 将当前管理脚本原子复制到 /usr/local/bin/snell，之后可直接输入 snell 打开菜单。
+installManagerCommand(){
+    local source_path="$0"
+    local tmp_cmd="${snell_manager_cmd}.tmp.$$"
+
+    # 已经通过 snell 命令运行时无需自我覆盖，只校正执行权限。
+    if [ "$source_path" = "$snell_manager_cmd" ]; then
+        chmod 755 "$snell_manager_cmd" 2>/dev/null || return 1
+        return 0
+    fi
+
+    # 仅支持从实际脚本文件持久化；curl | sh 等纯管道执行无法可靠取得完整脚本内容。
+    [ -f "$source_path" ] && [ -r "$source_path" ] || return 1
+
+    # 不覆盖系统里已有的同名第三方命令；旧版/本脚本快捷命令允许刷新。
+    if [ -e "$snell_manager_cmd" ] || [ -L "$snell_manager_cmd" ]; then
+        if ! grep -q 'Description: Snell Server 管理脚本' "$snell_manager_cmd" 2>/dev/null; then
+            echo -e "${Tip} 检测到已有 ${snell_manager_cmd}，为避免覆盖其他程序，未创建 snell 快捷命令"
+            return 1
+        fi
+    fi
+
+    rm -f "$tmp_cmd"
+    if ! cp -f "$source_path" "$tmp_cmd"; then
+        rm -f "$tmp_cmd"
+        return 1
+    fi
+    if ! chmod 755 "$tmp_cmd" || ! mv -f "$tmp_cmd" "$snell_manager_cmd"; then
+        rm -f "$tmp_cmd"
+        return 1
+    fi
+    return 0
 }
 
 # 检查是否为 Root 用户
@@ -795,6 +832,127 @@ configureShadowTLSValues(){
     setShadowTLSStrict
 }
 
+# Snell 首次安装时直接进入 ShadowTLS 设置流程（默认启用）
+configureShadowTLSDuringInstall(){
+    install_shadowtls="true"
+    stls_port=""; stls_sni=""; stls_password=""; stls_strict="false"
+    echo
+    echo "ShadowTLS v3"
+    echo " 1) 启用 ShadowTLS（默认，推荐）"
+    echo " 2) 暂不启用"
+    while true; do
+        readInput "选择 [1/2]（默认 1.启用）："
+        stls_install_choice="$REPLY"
+        [ -z "$stls_install_choice" ] && stls_install_choice="1"
+        case "$stls_install_choice" in
+            1)
+                install_shadowtls="true"
+                echo -e "${Tip} 启用后公网连接将先经过 ShadowTLS，再转发到本机 Snell"
+                configureShadowTLSValues
+                break
+                ;;
+            2)
+                install_shadowtls="false"
+                echo -e "${Info} 本次不安装 ShadowTLS，可稍后在主菜单中启用"
+                break
+                ;;
+            *) echo -e "${Error} 输入无效，仅支持 1 或 2" ;;
+        esac
+    done
+}
+
+waitShadowTLSStart(){
+    local i=0
+    while [ "$i" -lt 10 ]; do
+        sleep 1
+        checkShadowTLSStatus
+        [ "$stls_status" = "running" ] && break
+        i=$((i + 1))
+    done
+}
+
+# 确保 Snell 后端和 ShadowTLS 均已启动；ShadowTLS 服务同时保持开机自启
+ensureShadowTLSRunning(){
+    shadowTLSConfigured || return 1
+    setupShadowTLSService || return 1
+
+    checkStatus
+    if [ "$status" != "running" ]; then
+        if ! svc start; then
+            echo -e "${Error} Snell Server 启动失败，无法启动 ShadowTLS"
+            return 1
+        fi
+        waitServiceStart
+    fi
+    if [ "$status" != "running" ]; then
+        echo -e "${Error} Snell Server 未运行，无法启动 ShadowTLS"
+        return 1
+    fi
+
+    checkShadowTLSStatus
+    if [ "$stls_status" != "running" ]; then
+        if ! shadowSvc start; then
+            echo -e "${Error} ShadowTLS 启动命令失败"
+            return 1
+        fi
+        waitShadowTLSStart
+    fi
+    if [ "$stls_status" != "running" ]; then
+        echo -e "${Error} ShadowTLS 启动后未运行"
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl -u shadow-tls -n 20 --no-pager
+        elif [ -f /var/log/shadow-tls.log ]; then
+            tail -20 /var/log/shadow-tls.log
+        fi
+        return 1
+    fi
+    return 0
+}
+
+restartShadowTLS(){
+    shadowTLSConfigured || { echo -e "${Error} ShadowTLS 尚未安装"; sleep 2; return 1; }
+    setupShadowTLSService || { echo -e "${Error} ShadowTLS 服务配置失败"; sleep 2; return 1; }
+
+    checkStatus
+    if [ "$status" != "running" ]; then
+        echo -e "${Tip} Snell Server 当前未运行，将先自动启动 Snell"
+        if ! svc start; then
+            echo -e "${Error} Snell Server 启动失败，无法重启 ShadowTLS"
+            sleep 2
+            return 1
+        fi
+        waitServiceStart
+        if [ "$status" != "running" ]; then
+            echo -e "${Error} Snell Server 启动后未运行，无法重启 ShadowTLS"
+            sleep 2
+            return 1
+        fi
+    fi
+
+    if ! shadowSvc restart; then
+        shadowSvc start >/dev/null 2>&1 || {
+            echo -e "${Error} ShadowTLS 重启命令失败"
+            sleep 2
+            return 1
+        }
+    fi
+    waitShadowTLSStart
+    if [ "$stls_status" = "running" ]; then
+        echo -e "${Info} ShadowTLS 已重启"
+    else
+        echo -e "${Error} ShadowTLS 重启后未运行"
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl -u shadow-tls -n 20 --no-pager
+        elif [ -f /var/log/shadow-tls.log ]; then
+            tail -20 /var/log/shadow-tls.log
+        fi
+        sleep 2
+        return 1
+    fi
+    sleep 2
+    return 0
+}
+
 installShadowTLS(){
     checkInstalledStatus || return 1
     readConfig || return 1
@@ -809,8 +967,7 @@ installShadowTLS(){
     confirm="$REPLY"; [ -z "$confirm" ] && confirm="y"
     [ "$confirm" = "n" ] || [ "$confirm" = "N" ] && return 0
 
-    local old_listen="$listen_val" was_running=false
-    checkStatus; [ "$status" = "running" ] && was_running=true
+    local old_listen="$listen_val"
     installShadowTLSBinary || return 1
     writeShadowTLSConfig || { removeShadowTLSArtifacts; return 1; }
     listen_val="127.0.0.1:${port}"
@@ -820,13 +977,14 @@ installShadowTLS(){
         listen_val="$old_listen"; writeConfig >/dev/null 2>&1 || true
         return 1
     fi
-    if [ "$was_running" = true ]; then
-        svc restart >/dev/null 2>&1 || return 1
-        waitServiceStart
-        [ "$status" = "running" ] && shadowSvc start >/dev/null 2>&1 || true
+
+    # ShadowTLS 启用后立即自动启动；若 Snell 原本停止，也会先启动 Snell 后端
+    if ! ensureShadowTLSRunning; then
+        echo -e "${Error} ShadowTLS 已安装，但自动启动失败"
+        sleep 2
+        return 1
     fi
-    echo -e "${Info} ShadowTLS 安装完成"
-    [ "$was_running" != true ] && echo -e "${Tip} Snell 原本为停止状态，ShadowTLS 保持停止"
+    echo -e "${Info} ShadowTLS 安装完成并已自动启动（已设置开机自启）"
     sleep 2
 }
 
@@ -839,22 +997,44 @@ modifyShadowTLS(){
     writeShadowTLSConfig || return 1
     listen_val="127.0.0.1:${port}"; writeConfig || return 1
     setupShadowTLSService || return 1
+
+    # 修改后立即应用新配置，并继续保持自动运行状态
     checkStatus
-    if [ "$status" = "running" ]; then
-        svc restart >/dev/null 2>&1 || true; waitServiceStart
-        [ "$status" = "running" ] && shadowSvc restart >/dev/null 2>&1 || true
+    if [ "$status" != "running" ]; then
+        svc start >/dev/null 2>&1 || { echo -e "${Error} Snell Server 启动失败"; sleep 2; return 1; }
+        waitServiceStart
     fi
-    echo -e "${Info} ShadowTLS 配置已更新"; sleep 2
+    if [ "$status" != "running" ]; then
+        echo -e "${Error} Snell Server 未运行，无法应用 ShadowTLS 配置"
+        sleep 2
+        return 1
+    fi
+    shadowSvc restart >/dev/null 2>&1 || shadowSvc start >/dev/null 2>&1 || {
+        echo -e "${Error} ShadowTLS 新配置启动失败"
+        sleep 2
+        return 1
+    }
+    waitShadowTLSStart
+    [ "$stls_status" = "running" ] || { echo -e "${Error} ShadowTLS 新配置未运行"; sleep 2; return 1; }
+    echo -e "${Info} ShadowTLS 配置已更新并自动运行"; sleep 2
 }
 
 updateShadowTLS(){
     shadowTLSConfigured || { echo -e "${Error} ShadowTLS 尚未安装"; sleep 2; return 1; }
-    local old_ver new_ver was_running=false
+    local old_ver new_ver
     old_ver=$("${shadowtls_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    checkShadowTLSStatus; [ "$stls_status" = "running" ] && was_running=true
     installShadowTLSBinary || return 1
     new_ver=$("${shadowtls_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    [ "$was_running" = true ] && shadowSvc restart >/dev/null 2>&1 || true
+    setupShadowTLSService || return 1
+    if ! ensureShadowTLSRunning; then
+        echo -e "${Error} ShadowTLS 更新后自动启动失败"
+        sleep 2
+        return 1
+    fi
+    # 二进制更新后必须重启进程才能加载新版本
+    shadowSvc restart >/dev/null 2>&1 || { echo -e "${Error} ShadowTLS 更新后重启失败"; sleep 2; return 1; }
+    waitShadowTLSStart
+    [ "$stls_status" = "running" ] || { echo -e "${Error} ShadowTLS 更新后未运行"; sleep 2; return 1; }
     [ "$old_ver" = "$new_ver" ] && echo -e "${Info} 已是最新版本：v${new_ver}" || echo -e "${Info} 已更新：v${old_ver:-?} → v${new_ver:-?}"
     sleep 2
 }
@@ -893,7 +1073,8 @@ shadowTLSMenu(){
         simpleHeader; echo; echo "ShadowTLS 管理"
         if shadowTLSConfigured; then
             echo " 1) 修改配置    2) 查看状态"
-            echo " 3) 更新程序    4) 卸载 ShadowTLS"
+            echo " 3) 重启服务    4) 更新程序"
+            echo " 5) 卸载 ShadowTLS"
         else
             echo " 1) 安装 ShadowTLS v3"
         fi
@@ -903,8 +1084,9 @@ shadowTLSMenu(){
             0|'') return 0 ;;
             1) if shadowTLSConfigured; then modifyShadowTLS; else installShadowTLS; fi ;;
             2) viewShadowTLSStatus ;;
-            3) updateShadowTLS ;;
-            4) uninstallShadowTLS ;;
+            3) restartShadowTLS ;;
+            4) updateShadowTLS ;;
+            5) uninstallShadowTLS ;;
             *) echo -e "${Error} 输入无效"; sleep 2 ;;
         esac
     done
@@ -1621,13 +1803,18 @@ applyVersionSwitch(){
 cleanupFailedInstall(){
     rm -f "${snell_bin}" /etc/systemd/system/snell-server.service /etc/init.d/snell-server
     rm -rf "${snell_dir}"
+    # 首次安装流程若同时配置了 ShadowTLS，失败时一并清理残留
+    if [ -e "${shadowtls_bin}" ] || [ -e "${shadowtls_conf}" ] || [ -e /etc/systemd/system/shadow-tls.service ] || [ -e /etc/init.d/shadow-tls ]; then
+        removeShadowTLSArtifacts
+    fi
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1
 }
 
-# 安装 Snell 核心流程（按版本参数化配置项与下载源）
+# 安装 Snell 核心流程（包含 ShadowTLS 可选设置与自动启动）
 installSnellCore(){
 	local v=$1
 	local target_ver=""
+    install_shadowtls="false"
 	installDependencies || return 1
 	setPort
 	setPSK
@@ -1640,6 +1827,10 @@ installSnellCore(){
 		setIpv6
 		setTFO
 	fi
+
+    # 在 Snell 首次安装过程中直接配置 ShadowTLS
+    configureShadowTLSDuringInstall
+
 	if [ "$v" = "6" ]; then
 		target_ver=${snell_v6_version}
 	else
@@ -1651,6 +1842,19 @@ installSnellCore(){
 		startMenu
 		return 1
 	fi
+
+    if [ "$install_shadowtls" = "true" ]; then
+        if ! installShadowTLSBinary || ! writeShadowTLSConfig; then
+            echo -e "${Error} ShadowTLS 安装失败"
+            cleanupFailedInstall
+            sleep 2
+            startMenu
+            return 1
+        fi
+        # ShadowTLS 对外监听，Snell 只作为本机后端
+        listen_val="127.0.0.1:${port}"
+    fi
+
 	if ! setupService || ! writeConfig; then
 		echo -e "${Error} Snell Server 安装配置失败"
 		cleanupFailedInstall
@@ -1658,10 +1862,34 @@ installSnellCore(){
 		startMenu
 		return 1
 	fi
+
+    if [ "$install_shadowtls" = "true" ] && ! setupShadowTLSService; then
+        echo -e "${Error} ShadowTLS 服务注册失败"
+        cleanupFailedInstall
+        sleep 2
+        startMenu
+        return 1
+    fi
+
 	startSnell || {
 		startMenu
 		return 1
 	}
+
+    if [ "$install_shadowtls" = "true" ]; then
+        checkShadowTLSStatus
+        if [ "$stls_status" != "running" ]; then
+            echo -e "${Error} ShadowTLS 未能自动启动"
+            sleep 2
+            startMenu
+            return 1
+        fi
+        echo -e "${Info} ShadowTLS 已自动启动并设置为开机自启"
+    fi
+    if installManagerCommand; then
+        manager_cmd_ready=true
+        echo -e "${Info} 快捷命令已安装：以后直接输入 ${Green_font_prefix}snell${Font_color_suffix} 打开管理菜单"
+    fi
     viewConfig
 }
 
@@ -1670,6 +1898,13 @@ startSnell(){
     checkInstalledStatus || return 1
     checkStatus
     if [ "$status" = "running" ]; then
+        if shadowTLSConfigured; then
+            ensureShadowTLSRunning || {
+                echo -e "${Error} Snell 正在运行，但 ShadowTLS 自动启动失败"
+                sleep 2
+                return 1
+            }
+        fi
         return 0
     fi
     if ! svc start; then
@@ -1687,8 +1922,11 @@ startSnell(){
         return 1
     fi
     if shadowTLSConfigured; then
-        setupShadowTLSService >/dev/null 2>&1 || true
-        shadowSvc start >/dev/null 2>&1 || shadowSvc restart >/dev/null 2>&1 || true
+        if ! ensureShadowTLSRunning; then
+            echo -e "${Error} Snell 已启动，但 ShadowTLS 自动启动失败"
+            sleep 2
+            return 1
+        fi
     fi
     return 0
 }
@@ -2005,6 +2243,12 @@ uninstallSnell(){
 	echo -e "${Info} 清理运行时文件"
 	rm -f /run/snell-server.pid /var/log/snell-server.log
 
+    echo -e "${Info} 移除 snell 快捷命令"
+    # 仅删除本脚本创建的快捷命令，避免误删同名第三方程序。
+    if [ -f "$snell_manager_cmd" ] && grep -q 'Description: Snell Server 管理脚本' "$snell_manager_cmd" 2>/dev/null; then
+        rm -f "$snell_manager_cmd"
+    fi
+
 	echo && echo -e "${Green_font_prefix}Snell Server 卸载完成！${Font_color_suffix}" && echo
 	sleep 2
     startMenu
@@ -2207,5 +2451,12 @@ startMenu(){
 checkRoot
 checkSys
 sysArch || exit 1
+
+# 每次用新版脚本启动时自动安装/刷新快捷入口。
+# 这样首次运行后即可直接执行：snell
+manager_cmd_ready=false
+if installManagerCommand; then
+    manager_cmd_ready=true
+fi
 
 startMenu

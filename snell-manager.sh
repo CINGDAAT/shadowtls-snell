@@ -1,2035 +1,2211 @@
 #!/bin/sh
-set -eu
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+export PATH
 
-# Snell v5/v6 manager for Alpine Linux (version-agnostic; ShadowTLS v3 + safe QUIC handling + TFO)
-# POSIX /bin/sh compatible (BusyBox ash).
-#
-# Usage:
-#   ./snell-manager.sh                # interactive menu
-#   ./snell-manager.sh install [5|6]
-#   ./snell-manager.sh update
-#   ./snell-manager.sh show
-#   ./snell-manager.sh port 6160
-#   ./snell-manager.sh psk [NEW_PSK]
-#   ./snell-manager.sh mode default|unshaped|unsafe-raw
-#   ./snell-manager.sh dns default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only
-#   ./snell-manager.sh host <server_ip_or_domain>
-#   ./snell-manager.sh local-dns show
-#   ./snell-manager.sh local-dns set 1.1.1.1 8.8.8.8
-#   ./snell-manager.sh local-dns restore
-#   ./snell-manager.sh ipv6 on|off
-#   ./snell-manager.sh tfo on|off
-#   ./snell-manager.sh shadowtls enable|disable|update|show
-#   ./snell-manager.sh restart|start|stop|status
-#   ./snell-manager.sh logs
-#   ./snell-manager.sh uninstall [--yes]
-#
-# Optional environment variables for install:
-#   PORT=6160
-#   PSK=your_psk
-#   MODE=default|unshaped|unsafe-raw
-#   DNS_PREFERENCE=default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only
-#   ENABLE_IPV6=0|1
-#   SERVER_HOST=1.2.3.4_or_domain
-#   CLIENT_TFO=0|1
-#   SHADOWTLS_ENABLE=0|1            # Snell v5 only
-#   SHADOWTLS_PORT=8443             # public TCP port
-#   SHADOWTLS_SNI=www.icloud.com
-#   SHADOWTLS_PASSWORD=...
-#   SHADOWTLS_URL=https://github.com/ihciah/shadow-tls/releases/download/...  # optional manual override; otherwise latest is resolved automatically
-#   LOCAL_DNS="1.1.1.1 8.8.8.8"
-#   SNELL_VERSION=5|6
-#   SNELL_URL=https://.../snell-server-v5-or-v6...-linux-amd64.zip
-#   ALLOW_UNSAFE_RAW=1
+#==============================================
+#	System Required: Debian/Alpine
+#	Description: Snell Server 管理脚本
+#==============================================
 
-CONF_DIR="/etc/snell"
-CONF_FILE="${CONF_DIR}/snell-server.conf"
-BIN_FILE="/usr/local/bin/snell-server"
-INIT_FILE="/etc/init.d/snell"
-LOG_FILE="/var/log/snell.log"
-STATE_FILE="${CONF_DIR}/manager.conf"
-DNS_BACKUP_FILE="${CONF_DIR}/resolv.conf.backup"
-RESOLV_CONF="/etc/resolv.conf"
-UDHCPC_CONF="/etc/udhcpc/udhcpc.conf"
-UDHCPC_BACKUP_FILE="${CONF_DIR}/udhcpc.conf.backup"
-SERVICE_NAME="snell"
-RELEASE_PAGE="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell"
-SHADOWTLS_BIN="/usr/local/bin/shadow-tls"
-SHADOWTLS_INIT="/etc/init.d/shadowtls-snell"
-SHADOWTLS_LOG="/var/log/shadowtls-snell.log"
-SHADOWTLS_SERVICE="shadowtls-snell"
-SHADOWTLS_RELEASE_API="https://api.github.com/repos/ihciah/shadow-tls/releases/latest"
-SHADOWTLS_LATEST_PAGE="https://github.com/ihciah/shadow-tls/releases/latest"
-SHADOWTLS_LATEST_DOWNLOAD_BASE="https://github.com/ihciah/shadow-tls/releases/latest/download"
-DEFAULT_SHADOWTLS_SNI="www.icloud.com"
+snell_v5_version="5.0.1"
+snell_v6_version="6.0.0rc2"
+snell_dir="/etc/snell/"
+snell_bin="/usr/local/bin/snell-server"
+snell_conf="/etc/snell/config.conf"
+snell_version_file="/etc/snell/ver.txt"
 
-log() { printf '%s\n' "[snell] $*"; }
-warn() { printf '%s\n' "[snell] WARNING: $*" >&2; }
-die() { printf '%s\n' "[snell] ERROR: $*" >&2; exit 1; }
+# ShadowTLS（作为 Snell 的 TCP 前置层）
+shadowtls_dir="/etc/shadow-tls"
+shadowtls_bin="/usr/local/bin/shadow-tls"
+shadowtls_conf="/etc/shadow-tls/config.conf"
+shadowtls_version_file="/etc/shadow-tls/ver.txt"
 
-require_root() {
-  [ "$(id -u)" -eq 0 ] || die "Please run as root."
+Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Red_background_prefix="\033[41;37m" && Font_color_suffix="\033[0m" && Yellow_font_prefix="\033[0;33m"
+Info="${Green_font_prefix}✓${Font_color_suffix}"
+Error="${Red_font_prefix}✗${Font_color_suffix}"
+Tip="${Yellow_font_prefix}!${Font_color_suffix}"
+
+# 简洁终端输出
+clearScreen(){
+    [ -n "${TERM:-}" ] && clear 2>/dev/null || true
 }
 
-check_platform() {
-  [ -f /etc/alpine-release ] || die "This script only supports Alpine Linux."
-  command -v apk >/dev/null 2>&1 || die "apk was not found; this does not look like a usable Alpine Linux system."
-
-  ALPINE_VERSION="$(cat /etc/alpine-release 2>/dev/null || true)"
-  [ -n "$ALPINE_VERSION" ] || ALPINE_VERSION="unknown"
-
-  # Deliberately do not whitelist Alpine release numbers. Future and older
-  # releases are accepted and actual compatibility is checked at runtime.
-  case "$(uname -m)" in
-    x86_64) SNELL_ARCH="amd64" ;;
-    aarch64|arm64) SNELL_ARCH="aarch64" ;;
-    armv7l|armv7) SNELL_ARCH="armv7l" ;;
-    i386|i486|i586|i686) SNELL_ARCH="i386" ;;
-    *) die "Unsupported CPU architecture: $(uname -m). No matching official Snell Linux package is known." ;;
-  esac
-}
-
-ensure_dependencies() {
-  log "Installing/checking dependencies on Alpine ${ALPINE_VERSION}..."
-  apk update || die "apk update failed. Check /etc/apk/repositories and network connectivity."
-
-  # Keep the base dependency set conservative so this also works on older
-  # Alpine branches. OpenRC is installed explicitly for minimal VPS images.
-  apk add --no-cache ca-certificates curl unzip openssl iproute2 openrc     || die "Unable to install required Alpine packages."
-
-  # Snell's Linux binary expects glibc-compatible APIs. Prefer gcompat on
-  # modern Alpine. Older branches may only have libc6-compat in enabled repos.
-  if apk add --no-cache gcompat >/dev/null 2>&1; then
-    GLIBC_COMPAT="gcompat"
-  elif apk add --no-cache libc6-compat >/dev/null 2>&1; then
-    GLIBC_COMPAT="libc6-compat"
-    warn "gcompat is unavailable; using libc6-compat as a best-effort fallback."
-  else
-    die "Neither gcompat nor libc6-compat could be installed. Enable the appropriate Alpine repositories or use a newer Alpine release."
-  fi
-
-  update-ca-certificates >/dev/null 2>&1 || true
-}
-
-trim_value() {
-  # Usage: trim_value "text"
-  printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
-}
-
-state_get() {
-  key="$1"
-  [ -f "$STATE_FILE" ] || return 1
-  awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$STATE_FILE"
-}
-
-state_set() {
-  key="$1"
-  value="$2"
-  mkdir -p "$CONF_DIR"
-  chmod 700 "$CONF_DIR"
-  umask 077
-  tmp="${STATE_FILE}.tmp.$$"
-  if [ -f "$STATE_FILE" ]; then
-    awk -F= -v key="$key" '$1 != key {print}' "$STATE_FILE" > "$tmp"
-  else
-    : > "$tmp"
-  fi
-  printf '%s=%s\n' "$key" "$value" >> "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$STATE_FILE"
-}
-
-validate_snell_major() {
-  case "$1" in
-    5|6) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-installed_major_from_version() {
-  ver="$(installed_version 2>/dev/null || true)"
-  case "$ver" in
-    v5*) printf '5\n' ;;
-    v6*) printf '6\n' ;;
-    *) return 1 ;;
-  esac
-}
-
-current_snell_major() {
-  major="$(installed_major_from_version 2>/dev/null || true)"
-  if validate_snell_major "$major"; then
-    printf '%s\n' "$major"
-    return 0
-  fi
-
-  major="$(state_get SNELL_MAJOR 2>/dev/null || true)"
-  if validate_snell_major "$major"; then
-    printf '%s\n' "$major"
-    return 0
-  fi
-
-  if [ -f "$CONF_FILE" ]; then
-    if grep -Eq '^[[:space:]]*(dns-ip-preference|mode)[[:space:]]*=' "$CONF_FILE"; then
-      printf '6\n'
-      return 0
+readInput(){
+    if [ -n "$1" ]; then
+        printf '> %s' "$1"
+    else
+        printf '> '
     fi
-    if grep -Eq '^[[:space:]]*ipv6[[:space:]]*=' "$CONF_FILE"; then
-      printf '5\n'
-      return 0
-    fi
-  fi
-  return 1
+
+    # 无交互输入时优雅退出，避免 EOF 触发菜单递归
+    IFS= read -r REPLY || exit 0
 }
 
-select_snell_major_on_install() {
-  requested="${SNELL_VERSION:-}"
-  current="$(current_snell_major 2>/dev/null || true)"
-  default_major="${current:-6}"
+simpleHeader(){
+    clearScreen
+    echo
+    if [ -e "${snell_bin}" ] && [ -e "${snell_conf}" ]; then
+        checkStatus
+        local header_ver
+        header_ver=$(sed 's/^v//' "${snell_version_file}" 2>/dev/null)
+        [ -z "$header_ver" ] && header_ver=$(confVersion)
+        printf 'server: v%s · %s\n' "$header_ver" "$status"
+        if shadowTLSConfigured; then
+            readShadowTLSConfig >/dev/null 2>&1 || true
+            checkShadowTLSStatus
+            printf 'shadowtls: v3 · %s · :%s\n' "$stls_status" "${stls_port:-?}"
+        fi
+    else
+        echo 'server: not installed'
+    fi
+}
 
-  if [ -n "$requested" ]; then
-    validate_snell_major "$requested" || die "SNELL_VERSION must be 5 or 6."
-    TARGET_MAJOR="$requested"
-  elif [ -t 0 ]; then
-    while :; do
-      printf 'Snell version to install [5/6] [%s]: ' "$default_major"
-      read -r requested || die "Unable to read Snell version."
-      requested="$(trim_value "$requested")"
-      [ -n "$requested" ] || requested="$default_major"
-      if validate_snell_major "$requested"; then
-        TARGET_MAJOR="$requested"
-        break
-      fi
-      warn "Enter 5 or 6."
+pauseMenu(){
+    echo
+    readInput "按回车返回主菜单"
+    startMenu
+}
+
+# dash/ash 兼容的 echo（dash 原生 echo 不支持 -e/-n，统一走 printf %b）
+# shellcheck disable=SC3037
+echo() {
+    local opt_n=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) opt_n=1; shift ;;
+            -e) shift ;;
+            *) break ;;
+        esac
     done
-  else
-    TARGET_MAJOR="$default_major"
-  fi
-
-  if [ "$TARGET_MAJOR" = "6" ] && [ "$SNELL_ARCH" = "armv7l" ]; then
-    die "Official Snell v6 does not currently provide an armv7l Linux package. Use Snell v5 on this CPU."
-  fi
-  export TARGET_MAJOR
-  log "Selected Snell v${TARGET_MAJOR}."
+    if [ -n "$opt_n" ]; then
+        printf '%b' "$*"
+    else
+        printf '%b\n' "$*"
+    fi
 }
 
-normalize_server_host() {
-  host="$(trim_value "$1")"
-  case "$host" in
-    \[*\]) host="${host#\[}"; host="${host%\]}" ;;
-  esac
-  printf '%s\n' "$host"
+# 读取配置中的协议版本号（config.conf version = 6 -> 6）
+confVersion(){
+	awk -F '=' '
+		$1 ~ /^[[:space:]]*version[[:space:]]*$/ {
+			v=$2
+			sub(/^[[:space:]]*/, "", v)
+			sub(/[[:space:]]*$/, "", v)
+			print v
+			exit
+		}
+	' "${snell_conf}" 2>/dev/null
 }
 
-validate_ipv4() {
-  printf '%s\n' "$1" | awk -F. '
-    NF != 4 {ok=0; exit}
-    BEGIN {ok=1}
-    {
-      for (i=1; i<=4; i++) {
-        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) {ok=0; exit}
-      }
-    }
-    END {exit ok ? 0 : 1}
-  ' >/dev/null 2>&1
+# 检查是否为 Root 用户
+checkRoot(){
+	[ "$(id -u)" != 0 ] && echo -e "${Error} 需要 ROOT 权限，请使用 sudo -i" && exit 1
 }
 
-validate_server_host() {
-  host="$(normalize_server_host "$1")"
-  [ -n "$host" ] || return 1
-  case "$host" in
-    *[!A-Za-z0-9._:-]*|*..*|.*|*.) return 1 ;;
-  esac
-  case "$host" in
-    *:*)
-      case "$host" in *[!0-9A-Fa-f:.]*) return 1 ;; esac
-      ;;
-    *.*)
-      case "$host" in
-        *[!0-9.]*) : ;;
-        *) validate_ipv4 "$host" || return 1 ;;
-      esac
-      ;;
-  esac
-  return 0
+# 检查系统类型
+checkSys(){
+	if [ -f /etc/alpine-release ]; then
+		release="alpine"
+	elif [ -f /etc/debian_version ]; then
+		release="debian"
+	else
+		release="unsupported"
+		echo -e "${Error} 不支持的系统！本脚本仅支持 Debian/Alpine。"
+		exit 1
+	fi
 }
 
-current_server_host() {
-  if [ -n "${SERVER_HOST:-}" ]; then
-    normalize_server_host "$SERVER_HOST"
-  else
-    state_get SERVER_HOST 2>/dev/null || true
-  fi
+# 安装运行依赖（仅在缺少命令时更新软件源）
+installDependencies(){
+	if [ "${release}" = "alpine" ]; then
+		apk add --no-cache curl unzip tzdata gcompat upx iproute2 >/dev/null 2>&1 || {
+			echo -e "${Error} 依赖安装失败"
+			return 1
+		}
+	elif [ "${release}" = "debian" ]; then
+		local packages=""
+		command -v curl >/dev/null 2>&1 || packages="$packages curl"
+		command -v unzip >/dev/null 2>&1 || packages="$packages unzip"
+		command -v ss >/dev/null 2>&1 || packages="$packages iproute2"
+		[ -f /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-certificates"
+		if [ -n "$packages" ]; then
+			apt-get update >/dev/null 2>&1 && apt-get install -y $packages >/dev/null 2>&1 || {
+				echo -e "${Error} 依赖安装失败"
+				return 1
+			}
+		fi
+	fi
+	return 0
 }
 
-set_server_host() {
-  host="$(normalize_server_host "$1")"
-  validate_server_host "$host" || die "Invalid server IP/domain: ${1}"
-  state_set SERVER_HOST "$host"
-  SERVER_HOST="$host"
-  export SERVER_HOST
-  log "Server address saved as ${host}."
+# 检查系统架构
+sysArch() {
+    machine=$(uname -m)
+    case "$machine" in
+        i386|i686) arch="i386" ;;
+        armv6l)
+            arch="armv7l"
+            echo -e "${Tip} 检测到 armv6 架构，官方无对应构建，将尝试 armv7l 版本（可能无法运行）"
+            ;;
+        armv7l|armv7*) arch="armv7l" ;;
+        aarch64|armv8*) arch="aarch64" ;;
+        x86_64|amd64) arch="amd64" ;;
+        *)
+            echo -e "${Error} 不支持的系统架构：${machine}"
+            return 1
+            ;;
+    esac
 }
 
-ensure_server_host() {
-  host="$(current_server_host)"
-  if [ -n "$host" ]; then
-    validate_server_host "$host" || die "Saved SERVER_HOST is invalid: ${host}"
-    state_set SERVER_HOST "$host"
-    return 0
-  fi
-  if [ -t 0 ]; then
-    while :; do
-      printf 'Server IP or domain (used by clients to connect): '
-      read -r host || die "Unable to read server address."
-      if validate_server_host "$host"; then
-        set_server_host "$host"
+# 检查 Snell 是否安装
+checkInstalledStatus(){
+	[ ! -e "${snell_bin}" ] && echo -e "${Error} Snell Server 没有安装，请检查！" && return 1
+	return 0
+}
+
+# 服务控制（自动适配 systemd / OpenRC）
+svc(){
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl "$1" snell-server >/dev/null 2>&1
+	elif command -v rc-service >/dev/null 2>&1; then
+		rc-service snell-server "$1" >/dev/null 2>&1
+	elif command -v service >/dev/null 2>&1; then
+		service snell-server "$1" >/dev/null 2>&1
+	else
+		return 1
+	fi
+}
+
+# 检查 Snell 运行状态
+checkStatus(){
+    status="stopped"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active snell-server.service >/dev/null 2>&1 && status="running"
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service snell-server status >/dev/null 2>&1 && status="running"
+    elif command -v service >/dev/null 2>&1; then
+        service snell-server status >/dev/null 2>&1 && status="running"
+    else
+        return 1
+    fi
+}
+
+# 版本号比较函数（优先正式版）
+compareVersions(){
+    local version1="$1"
+    local version2="$2"
+    local base_version1 base_version2 suffix1 suffix2 num1 num2 first_suffix
+
+    version1=$(printf '%s' "$version1" | sed 's/^v//')
+    version2=$(printf '%s' "$version2" | sed 's/^v//')
+    [ "$version1" = "$version2" ] && return 1
+
+    base_version1=$(printf '%s' "$version1" | sed 's/[a-z].*//')
+    base_version2=$(printf '%s' "$version2" | sed 's/[a-z].*//')
+
+    case "$version1" in *[a-z]*) suffix1=${version1#"$base_version1"} ;; *) suffix1="" ;; esac
+    case "$version2" in *[a-z]*) suffix2=${version2#"$base_version2"} ;; *) suffix2="" ;; esac
+
+    # 正式版高于同基础版本的测试版
+    if [ "$base_version1" = "$base_version2" ]; then
+        [ -z "$suffix1" ] && [ -n "$suffix2" ] && return 0
+        [ -n "$suffix1" ] && [ -z "$suffix2" ] && return 2
+
+        num1=$(printf '%s' "$suffix1" | grep -oE '[0-9]+$')
+        num2=$(printf '%s' "$suffix2" | grep -oE '[0-9]+$')
+        [ -z "$num1" ] && num1=0
+        [ -z "$num2" ] && num2=0
+        [ "$num1" -lt "$num2" ] && return 2
+        [ "$num1" -gt "$num2" ] && return 0
+        [ "$suffix1" = "$suffix2" ] && return 1
+        first_suffix=$(printf '%s\n' "$suffix1" "$suffix2" | LC_ALL=C sort | head -1)
+        [ "$first_suffix" = "$suffix1" ] && return 2
         return 0
-      fi
-      warn "Enter a valid IPv4, IPv6, or domain name without scheme or port."
-    done
-  fi
-  warn "SERVER_HOST is not set. Surge output will use YOUR_SERVER_IP until you run: $0 host <IP-or-domain>"
-}
-
-format_client_host() {
-  host="$1"
-  case "$host" in
-    *:*) printf '[%s]\n' "$host" ;;
-    *) printf '%s\n' "$host" ;;
-  esac
-}
-
-validate_dns_server() {
-  dns="$1"
-  [ -n "$dns" ] || return 1
-  case "$dns" in
-    *:*)
-      case "$dns" in *[!0-9A-Fa-f:.]*) return 1 ;; esac
-      return 0
-      ;;
-    *) validate_ipv4 "$dns" ;;
-  esac
-}
-
-backup_system_dns() {
-  mkdir -p "$CONF_DIR"
-  chmod 700 "$CONF_DIR"
-  if [ ! -f "$DNS_BACKUP_FILE" ]; then
-    if [ -e "$RESOLV_CONF" ]; then
-      cp -L "$RESOLV_CONF" "$DNS_BACKUP_FILE"
-    else
-      : > "$DNS_BACKUP_FILE"
     fi
-    chmod 600 "$DNS_BACKUP_FILE"
-    log "Backed up current DNS to ${DNS_BACKUP_FILE}."
-  fi
 
-  if [ -z "$(state_get UDHCPC_CONF_EXISTED 2>/dev/null || true)" ]; then
-    if [ -f "$UDHCPC_CONF" ]; then
-      cp "$UDHCPC_CONF" "$UDHCPC_BACKUP_FILE"
-      chmod 600 "$UDHCPC_BACKUP_FILE"
-      state_set UDHCPC_CONF_EXISTED 1
-    else
-      state_set UDHCPC_CONF_EXISTED 0
+    if printf '%s\n' "$base_version1" "$base_version2" | sort -V | head -1 | grep -q "^${base_version1}$"; then
+        return 2
     fi
-  fi
-}
-
-disable_dhcp_dns_overwrite() {
-  mkdir -p "$(dirname "$UDHCPC_CONF")"
-  tmp="${CONF_DIR}/udhcpc.conf.new.$$"
-  if [ -f "$UDHCPC_CONF" ]; then
-    awk '!/^[[:space:]]*RESOLV_CONF[[:space:]]*=/' "$UDHCPC_CONF" > "$tmp"
-  else
-    : > "$tmp"
-  fi
-  printf '%s\n' 'RESOLV_CONF="no"' >> "$tmp"
-  cat "$tmp" > "$UDHCPC_CONF"
-  chmod 644 "$UDHCPC_CONF"
-  rm -f "$tmp"
-}
-
-restore_udhcpc_dns_behavior() {
-  existed="$(state_get UDHCPC_CONF_EXISTED 2>/dev/null || true)"
-  case "$existed" in
-    1)
-      if [ -f "$UDHCPC_BACKUP_FILE" ]; then
-        cat "$UDHCPC_BACKUP_FILE" > "$UDHCPC_CONF"
-      fi
-      ;;
-    0)
-      if [ -f "$UDHCPC_CONF" ]; then
-        tmp="${CONF_DIR}/udhcpc.conf.restore.$$"
-        awk '!/^[[:space:]]*RESOLV_CONF[[:space:]]*=[[:space:]]*"?no"?[[:space:]]*$/' "$UDHCPC_CONF" > "$tmp"
-        cat "$tmp" > "$UDHCPC_CONF"
-        rm -f "$tmp"
-      fi
-      ;;
-  esac
-  rm -f "$UDHCPC_BACKUP_FILE"
-}
-
-show_system_dns() {
-  printf '\nCurrent Alpine system DNS (%s):\n' "$RESOLV_CONF"
-  if [ -r "$RESOLV_CONF" ]; then
-    found=0
-    while IFS= read -r dns; do
-      [ -n "$dns" ] || continue
-      printf '  - %s\n' "$dns"
-      found=1
-    done <<EOF_DNS
-$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' "$RESOLV_CONF")
-EOF_DNS
-    [ "$found" = "1" ] || printf '%s\n' '  (no nameserver entries)'
-  else
-    printf '%s\n' '  (unavailable)'
-  fi
-  if [ -f "$DNS_BACKUP_FILE" ]; then
-    printf 'Original DNS backup: %s\n' "$DNS_BACKUP_FILE"
-  else
-    printf '%s\n' 'Original DNS backup: none'
-  fi
-  if [ -f "$UDHCPC_CONF" ] && grep -Eq '^[[:space:]]*RESOLV_CONF[[:space:]]*=[[:space:]]*"?no"?' "$UDHCPC_CONF"; then
-    printf '%s\n' 'DHCP DNS overwrite: disabled (persistent static DNS)'
-  else
-    printf '%s\n' 'DHCP DNS overwrite: enabled / default'
-  fi
-}
-
-set_system_dns() {
-  [ "$#" -ge 1 ] || die "At least one DNS server is required."
-  [ "$#" -le 3 ] || die "Use at most 3 DNS servers."
-  for dns in "$@"; do
-    validate_dns_server "$dns" || die "Invalid DNS server IP: ${dns}"
-  done
-  backup_system_dns
-  disable_dhcp_dns_overwrite
-  tmp="${CONF_DIR}/resolv.conf.new.$$"
-  : > "$tmp"
-  for dns in "$@"; do
-    printf 'nameserver %s\n' "$dns" >> "$tmp"
-  done
-  if [ -r "$RESOLV_CONF" ]; then
-    awk '!/^[[:space:]]*nameserver[[:space:]]+/' "$RESOLV_CONF" >> "$tmp"
-  fi
-  cat "$tmp" > "$RESOLV_CONF"
-  rm -f "$tmp"
-  log "System DNS updated: $*"
-  log "Configured udhcpc not to overwrite /etc/resolv.conf, so the selected DNS persists across DHCP renewals/reboots."
-  show_system_dns
-}
-
-restore_system_dns() {
-  [ -f "$DNS_BACKUP_FILE" ] || die "No DNS backup is available to restore."
-  cat "$DNS_BACKUP_FILE" > "$RESOLV_CONF"
-  rm -f "$DNS_BACKUP_FILE"
-  restore_udhcpc_dns_behavior
-  log "Original system DNS and DHCP DNS behavior restored."
-  show_system_dns
-}
-
-configure_system_dns_on_install() {
-  if [ -n "${LOCAL_DNS:-}" ]; then
-    set -- $LOCAL_DNS
-    set_system_dns "$@"
     return 0
-  fi
-  [ -t 0 ] || return 0
-  printf 'Set Alpine local DNS now? [y/N]: '
-  read -r answer || return 0
-  case "$answer" in
-    y|Y|yes|YES)
-      printf 'DNS server IPs (space separated, max 3; e.g. 1.1.1.1 8.8.8.8): '
-      read -r dns_line || return 0
-      [ -n "$(trim_value "$dns_line")" ] || { warn "No DNS entered; skipped."; return 0; }
-      set -- $dns_line
-      set_system_dns "$@"
-      ;;
-    *) log "Keeping current Alpine system DNS." ;;
-  esac
 }
 
-conf_get() {
-  # Usage: conf_get key
-  key="$1"
-  [ -f "$CONF_FILE" ] || return 1
-  awk -F= -v key="$key" '
-    $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
-      value=$0
-      sub(/^[^=]*=/, "", value)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-      print value
-      exit
+# 验证版本 URL 是否有效
+validateVersionUrl(){
+    getSnellDownloadUrl "$1" || return 1
+    curl -fsSIL --proto '=https' --tlsv1.2 --max-time 10 "$snell_url" 2>/dev/null | grep -q '^HTTP/.* 200'
+}
+
+# 检查版本更新
+checkVersionUpdate(){
+    local current_ver installed_version bin_version script_version web_version
+    update_available=false
+    current_installed_version=""
+    latest_available_version=""
+    best_version=""
+
+    if [ -e "${snell_bin}" ] && [ -e "${snell_conf}" ]; then
+        current_ver=$(confVersion)
+
+        # 除 Snell v6 版外的旧版本已停更，不再检查在线更新
+        if [ "$current_ver" != "6" ]; then
+            update_available=false
+            return 0
+        fi
+
+        installed_version=""
+        if [ -e "${snell_version_file}" ]; then
+            installed_version=$(sed 's/^v//' "${snell_version_file}")
+        fi
+
+        # 尝试从二进制程序获取真实版本，兼容缺失或过期的 ver.txt
+        if [ -x "${snell_bin}" ]; then
+            if command -v timeout >/dev/null 2>&1; then
+                for opt in --version -v --help; do
+                    bin_version=$(timeout 1 "${snell_bin}" "$opt" 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9]*' | head -1)
+                    [ -n "$bin_version" ] && break
+                done
+            else
+                bin_version=$("${snell_bin}" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9]*' | head -1)
+            fi
+
+            if [ -n "$bin_version" ]; then
+                installed_version="$bin_version"
+                echo "v${installed_version}" > "${snell_version_file}"
+            fi
+        fi
+
+        # 无法识别真实版本时，不执行在线更新，避免生成空版本号 URL
+        if [ -z "$installed_version" ]; then
+            current_installed_version="unknown"
+            return 0
+        fi
+
+        current_installed_version="$installed_version"
+
+            # 仅 v6 可在线更新（v5 走 updateV5toV6，已在函数开头返回）
+            script_version=${snell_v6_version}
+            web_version=$(getLatestVersionFromWeb "v6")
+
+            # 优先使用脚本内置版本，除非网页版本更新
+            best_version="$installed_version"
+
+            # 首先比较脚本内置版本
+            if [ -n "$script_version" ]; then
+                compareVersions "$best_version" "$script_version"
+                case $? in
+                    2)  # best_version < script_version
+                        # 验证脚本内置版本的 URL 是否有效
+                        if validateVersionUrl "$script_version"; then
+                            best_version="$script_version"
+                        else
+                            :
+                        fi
+                        ;;
+                esac
+            fi
+
+            # 然后比较网页版本，只有当网页版本比当前最佳版本更新时才采用
+            if [ -n "$web_version" ]; then
+                compareVersions "$best_version" "$web_version"
+                if [ $? -eq 2 ]; then  # best_version < web_version
+                    # 验证网页版本的 URL 是否有效
+                    if validateVersionUrl "$web_version"; then
+                        best_version="$web_version"
+                    else
+                        :
+                    fi
+                fi
+            fi
+
+            latest_available_version="$best_version"
+
+            # 如果最佳版本与当前安装版本不同，则有更新可用
+            compareVersions "$installed_version" "$best_version"
+            if [ $? -eq 2 ]; then
+                update_available=true
+            fi
+    fi
+}
+
+# 获取 Snell 下载链接
+getSnellDownloadUrl(){
+	sysArch || return 1
+	snell_url="https://dl.nssurge.com/snell/snell-server-v${1}-linux-${arch}.zip"
+}
+
+# 下载 zip 并安装（临时目录隔离，失败自动清理）
+installFromZip(){
+    local version=$1
+    local version_type=$2
+    local url=$3
+    local tmp_dir zip_file
+
+    tmp_dir=$(mktemp -d /tmp/snell-install.XXXXXX) || {
+        echo -e "${Error} 无法创建临时目录"
+        return 1
     }
-  ' "$CONF_FILE"
-}
+    zip_file="${tmp_dir}/snell-server.zip"
 
-config_exists() {
-  [ -s "$CONF_FILE" ]
-}
-
-service_exists() {
-  [ -x "$INIT_FILE" ]
-}
-
-binary_exists() {
-  [ -x "$BIN_FILE" ]
-}
-
-validate_port() {
-  port="$1"
-  case "$port" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
-}
-
-tcp_port_in_use() {
-  port="$1"
-  ss -lnt 2>/dev/null | awk 'NR > 1 {print $4}' | grep -Eq "(^|[:.])${port}$"
-}
-
-udp_port_in_use() {
-  port="$1"
-  ss -lun 2>/dev/null | awk 'NR > 1 {print $4}' | grep -Eq "(^|[:.])${port}$"
-}
-
-port_in_use_for_major() {
-  port="$1"
-  major="$2"
-  tcp_port_in_use "$port" && return 0
-  if [ "$major" = "5" ]; then
-    udp_port_in_use "$port" && return 0
-  fi
-  return 1
-}
-
-random_port() {
-  major="${1:-6}"
-  while :; do
-    n="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
-    port=$((10000 + n % 50001))
-    if ! port_in_use_for_major "$port" "$major"; then
-      printf '%s\n' "$port"
-      return 0
+    if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 --max-time 60 -o "${zip_file}" "${url}" >/dev/null 2>&1; then
+        echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 下载失败！"
+        rm -rf "${tmp_dir}"
+        return 1
     fi
-  done
-}
 
-random_psk() {
-  openssl rand -hex 16
-}
-
-configure_port_on_install() {
-  major="$1"
-  old_port="$(current_port 2>/dev/null || true)"
-
-  if [ -n "${PORT:-}" ]; then
-    validate_port "$PORT" || die "PORT must be an integer from 1 to 65535."
-    if [ "$PORT" != "$old_port" ] && port_in_use_for_major "$PORT" "$major"; then
-      if [ "$major" = "5" ]; then
-        die "TCP or UDP port ${PORT} is already in use. Snell v5 needs the selected port available on both protocols."
-      fi
-      die "TCP port ${PORT} is already in use."
+    if ! unzip -oq "${zip_file}" -d "${tmp_dir}" >/dev/null 2>&1 || [ ! -f "${tmp_dir}/snell-server" ] || [ -L "${tmp_dir}/snell-server" ]; then
+        echo -e "${Error} Snell Server ${Yellow_font_prefix}${version_type}${Font_color_suffix} 解压失败！"
+        rm -rf "${tmp_dir}"
+        return 1
     fi
-    return 0
-  fi
-
-  [ -t 0 ] || { PORT="${old_port:-$(random_port "$major")}"; export PORT; return 0; }
-  suggested_port="${old_port:-$(random_port "$major")}"
-  suggested_port="$(trim_value "$suggested_port")"
-  while :; do
-    printf 'Listen port [%s]: ' "$suggested_port"
-    read -r selected_port || die "Unable to read listen port."
-    selected_port="$(trim_value "$selected_port")"
-    [ -n "$selected_port" ] || selected_port="$suggested_port"
-    if ! validate_port "$selected_port"; then
-      warn "Enter a port from 1 to 65535."
-      continue
+    if ! chmod +x "${tmp_dir}/snell-server"; then
+        echo -e "${Error} 无法设置 Snell Server 执行权限"
+        rm -rf "${tmp_dir}"
+        return 1
     fi
-    if [ "$selected_port" != "$old_port" ] && port_in_use_for_major "$selected_port" "$major"; then
-      if [ "$major" = "5" ]; then
-        warn "TCP or UDP port ${selected_port} is already in use."
-      else
-        warn "TCP port ${selected_port} is already in use."
-      fi
-      continue
+
+    # Alpine: 官方二进制带 UPX 壳，需解包后才能由 gcompat 加载
+    if [ "${release}" = "alpine" ] && command -v upx >/dev/null 2>&1 \
+        && strings "${tmp_dir}/snell-server" 2>/dev/null | grep -q "UPX!"; then
+        if upx -d -o "${tmp_dir}/snell-server.unpacked" "${tmp_dir}/snell-server" >/dev/null 2>&1; then
+            mv -f "${tmp_dir}/snell-server.unpacked" "${tmp_dir}/snell-server"
+            chmod +x "${tmp_dir}/snell-server"
+        else
+            echo -e "${Error} Snell Server 解包失败"
+            rm -rf "${tmp_dir}"
+            return 1
+        fi
     fi
-    PORT="$selected_port"
-    export PORT
-    log "Listen port selected: ${PORT}."
+
+    mkdir -p "${snell_dir}" || {
+        echo -e "${Error} 无法创建 Snell 配置目录"
+        rm -rf "${tmp_dir}"
+        return 1
+    }
+    if ! mv -f "${tmp_dir}/snell-server" "${snell_bin}"; then
+        echo -e "${Error} 无法安装 Snell Server 主程序"
+        rm -rf "${tmp_dir}"
+        return 1
+    fi
+    if ! printf 'v%s\n' "${version}" > "${snell_version_file}"; then
+        echo -e "${Error} 无法记录 Snell Server 版本"
+        rm -rf "${tmp_dir}"
+        return 1
+    fi
+    rm -rf "${tmp_dir}"
     return 0
-  done
 }
 
-validate_tfo_state() {
-  case "$1" in
-    1|on|enable|enabled|true|yes) return 0 ;;
-    0|off|disable|disabled|false|no) return 0 ;;
-    *) return 1 ;;
-  esac
+# 通用下载并安装 Snell 函数
+downloadSnell(){
+	local version=$1
+	local version_type=$2
+
+	getSnellDownloadUrl "${version}" || return 1
+	installFromZip "${version}" "${version_type}" "${snell_url}"
 }
 
-normalize_tfo_state() {
-  case "$1" in
-    1|on|enable|enabled|true|yes) printf '1\n' ;;
-    0|off|disable|disabled|false|no) printf '0\n' ;;
-    *) return 1 ;;
-  esac
+# 安装 Snell
+installSnell() {
+	# 已安装时提示先卸载
+	if [ -e "${snell_bin}" ]; then
+		echo -e "${Error} 检测到 Snell Server 已安装！"
+		echo -e "${Tip} 如需重装，请先选择「卸载 Snell Server」"
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	simpleHeader
+	echo
+	echo "安装版本"
+	echo " 1) v5（${snell_v5_version}，稳定版）"
+	echo " 2) v6（${snell_v6_version}，最新版）"
+	readInput "选择 [1/2]（默认 1.v5）："
+	ver_choice="$REPLY"
+	[ -z "${ver_choice}" ] && ver_choice="1"
+	case "${ver_choice}" in
+		1) ver="5" ;;
+		2) ver="6" ;;
+		*)
+			echo -e "${Error} 输入无效，仅支持 1 或 2"
+			sleep 2
+			startMenu
+			return 1
+			;;
+	esac
+
+	echo -e "${Tip} 即将安装 Snell v${ver}（默认配置，安装后可用「设置配置」调整）"
+	readInput " 确认安装？(Y/n)（默认 y）: "
+	confirm="$REPLY"
+	[ -z "${confirm}" ] && confirm="y"
+	if [ "$confirm" != Y ] && [ "$confirm" != y ]; then
+		echo -e "${Info} 已取消安装"
+		sleep 2
+		startMenu
+		return 0
+	fi
+
+	if [ "${ver}" = "5" ]; then
+		installSnellCore 5
+	else
+		installSnellCore 6
+	fi
 }
 
-current_client_tfo() {
-  if [ -n "${CLIENT_TFO:-}" ]; then
-    normalize_tfo_state "$CLIENT_TFO" 2>/dev/null || printf '0\n'
-    return 0
-  fi
-  saved="$(state_get CLIENT_TFO 2>/dev/null || true)"
-  [ -n "$saved" ] || saved=0
-  normalize_tfo_state "$saved" 2>/dev/null || printf '0\n'
-}
-
-set_client_tfo() {
-  state="$(normalize_tfo_state "$1" 2>/dev/null || true)"
-  [ -n "$state" ] || die "Use: tfo on|off"
-  state_set CLIENT_TFO "$state"
-  CLIENT_TFO="$state"
-  export CLIENT_TFO
-  if [ "$state" = "1" ]; then
-    log "Surge TCP Fast Open (TFO) enabled for generated client configuration."
-  else
-    log "Surge TCP Fast Open (TFO) disabled for generated client configuration."
-  fi
-}
-
-configure_tfo_on_install() {
-  if [ -n "${CLIENT_TFO:-}" ]; then
-    set_client_tfo "$CLIENT_TFO"
-    return 0
-  fi
-  [ -t 0 ] || { state_set CLIENT_TFO 0; return 0; }
-  printf 'Enable Surge TCP Fast Open (TFO)? [y/N]: '
-  read -r answer || answer=''
-  case "$answer" in
-    y|Y|yes|YES) set_client_tfo 1 ;;
-    *) set_client_tfo 0 ;;
-  esac
-}
-
-normalize_bool_state() {
-  case "$1" in
-    1|on|enable|enabled|true|yes|y|Y) printf '1\n' ;;
-    0|off|disable|disabled|false|no|n|N) printf '0\n' ;;
-    *) return 1 ;;
-  esac
-}
-
-shadowtls_enabled() {
-  value="$(state_get SHADOWTLS_ENABLED 2>/dev/null || true)"
-  [ "$(normalize_bool_state "${value:-0}" 2>/dev/null || printf '0')" = "1" ]
-}
-
-shadowtls_binary_exists() { [ -x "$SHADOWTLS_BIN" ]; }
-shadowtls_service_exists() { [ -x "$SHADOWTLS_INIT" ]; }
-
-validate_shadowtls_sni() {
-  sni="$(trim_value "$1")"
-  [ -n "$sni" ] || return 1
-  case "$sni" in
-    *[!A-Za-z0-9.-]*|.*|*.|*..*|*:* ) return 1 ;;
-  esac
-  return 0
-}
-
-validate_shadowtls_password() {
-  password="$1"
-  [ -n "$password" ] || return 1
-  case "$password" in *[!A-Za-z0-9._-]*) return 1 ;; esac
-  return 0
-}
-
-random_shadowtls_password() {
-  openssl rand -hex 16
-}
-
-shadowtls_arch_target() {
-  case "$SNELL_ARCH" in
-    amd64) printf 'x86_64-unknown-linux-musl\n' ;;
-    aarch64) printf 'aarch64-unknown-linux-musl\n' ;;
-    armv7l) printf 'armv7-unknown-linux-musleabihf\n' ;;
-    i386) return 1 ;;
-    *) return 1 ;;
-  esac
-}
-
-get_shadowtls_latest_version() {
-  if [ -n "${SHADOWTLS_RELEASE_VERSION:-}" ]; then
-    printf '%s\n' "$SHADOWTLS_RELEASE_VERSION"
-    return 0
-  fi
-  version="$(curl -fsSL --retry 2 --connect-timeout 10 "$SHADOWTLS_RELEASE_API" 2>/dev/null \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
-  if [ -z "$version" ]; then
-    effective="$(curl -fsSL --retry 2 --connect-timeout 10 -o /dev/null -w '%{url_effective}' "$SHADOWTLS_LATEST_PAGE" 2>/dev/null || true)"
-    version="$(printf '%s' "$effective" | sed -n 's#.*/tag/##p')"
-  fi
-  [ -n "$version" ] && printf '%s\n' "$version"
-}
-
-resolve_shadowtls_url() {
-  if [ -n "${SHADOWTLS_URL:-}" ]; then
-    url="$SHADOWTLS_URL"
-  else
-    target="$(shadowtls_arch_target 2>/dev/null || true)"
-    [ -n "$target" ] || die "ShadowTLS prebuilt binaries used by this script are not available for ${SNELL_ARCH}. Snell v5 itself may still work without ShadowTLS."
-    asset="shadow-tls-${target}"
-
-    # Prefer the exact asset URL returned by GitHub's official latest-release API.
-    # This avoids pinning a ShadowTLS software version in the manager script.
-    release_json="$(curl -fsSL --retry 2 --connect-timeout 10 "$SHADOWTLS_RELEASE_API" 2>/dev/null || true)"
-    url="$(printf '%s\n' "$release_json" \
-      | grep -E '"browser_download_url"[[:space:]]*:' \
-      | grep "/${asset}\"" \
-      | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | head -n 1 || true)"
-
-    # GitHub also provides a stable latest/download route. Use it if the API is
-    # rate-limited or temporarily unavailable; it still resolves to latest.
-    [ -n "$url" ] || url="${SHADOWTLS_LATEST_DOWNLOAD_BASE}/${asset}"
-  fi
-  case "$url" in
-    https://github.com/ihciah/shadow-tls/releases/download/*/shadow-tls-*|\
-    https://github.com/ihciah/shadow-tls/releases/latest/download/shadow-tls-*) ;;
-    *) die "Refusing unexpected ShadowTLS URL: ${url}. Use an official ihciah/shadow-tls GitHub release URL." ;;
-  esac
-  printf '%s\n' "$url"
-}
-
-download_shadowtls_binary() {
-  url="$(resolve_shadowtls_url)"
-  log "Downloading latest ShadowTLS release asset: ${url}"
-  tmp="${SHADOWTLS_BIN}.new.$$"
-  effective_file="${tmp}.effective-url"
-  rm -f "$tmp" "$effective_file"
-  if ! curl -fL --retry 3 --connect-timeout 10 -o "$tmp" -w '%{url_effective}' "$url" > "$effective_file"; then
-    rm -f "$tmp" "$effective_file"
-    die "Failed to download ShadowTLS from the official latest release."
-  fi
-  [ -s "$tmp" ] || { rm -f "$tmp" "$effective_file"; die "Downloaded ShadowTLS binary is empty."; }
-  chmod 755 "$tmp"
-
-  help_output="$("$tmp" --help 2>&1 || true)"
-  if [ -z "$help_output" ]; then
-    help_output="$("$tmp" server --help 2>&1 || true)"
-  fi
-  if [ -z "$help_output" ]; then
-    rm -f "$tmp" "$effective_file"
-    die "Downloaded ShadowTLS binary cannot run on this Alpine/CPU."
-  fi
-  if ! printf '%s\n' "$help_output" | grep -q -- '--v3'; then
-    rm -f "$tmp" "$effective_file"
-    die "The latest ShadowTLS binary does not advertise --v3 support; refusing to install it for this V3 configuration."
-  fi
-
-  effective_url="$(cat "$effective_file" 2>/dev/null || true)"
-  mv "$tmp" "$SHADOWTLS_BIN"
-  rm -f "$effective_file"
-  release="$(printf '%s' "$effective_url" | sed -n 's#.*/releases/download/\([^/]*\)/.*#\1#p')"
-  if [ -z "$release" ]; then
-    release="$(get_shadowtls_latest_version 2>/dev/null || true)"
-  fi
-  [ -n "$release" ] && state_set SHADOWTLS_RELEASE "$release" || state_set SHADOWTLS_RELEASE latest
-  state_set SHADOWTLS_PROTOCOL 3
-  log "ShadowTLS installed: release ${release:-latest}, protocol V3."
-}
-
-current_shadowtls_port() { state_get SHADOWTLS_PORT 2>/dev/null || true; }
-current_shadowtls_sni() { state_get SHADOWTLS_SNI 2>/dev/null || true; }
-current_shadowtls_password() { state_get SHADOWTLS_PASSWORD 2>/dev/null || true; }
-
-shadowtls_public_port_available() {
-  port="$1"
-  old_port="$(current_shadowtls_port)"
-  [ "$port" = "$old_port" ] && shadowtls_service_exists && return 0
-  ! tcp_port_in_use "$port"
-}
-
-suggest_shadowtls_port() {
-  backend="$1"
-  old="$(current_shadowtls_port)"
-  if validate_port "$old" 2>/dev/null && [ "$old" != "$backend" ]; then
-    printf '%s\n' "$old"
-    return 0
-  fi
-  if [ "$backend" != "8443" ] && ! tcp_port_in_use 8443; then
-    printf '8443\n'
-    return 0
-  fi
-  while :; do
-    p="$(random_port 6)"
-    [ "$p" != "$backend" ] && ! tcp_port_in_use "$p" && { printf '%s\n' "$p"; return 0; }
-  done
-}
-
-set_shadowtls_details() {
-  backend_port="$1"
-  public_port="$2"
-  sni="$3"
-  password="$4"
-  validate_port "$public_port" || die "ShadowTLS public port must be 1-65535."
-  [ "$public_port" != "$backend_port" ] || die "ShadowTLS public port must differ from the Snell backend port."
-  shadowtls_public_port_available "$public_port" || die "TCP port ${public_port} is already in use."
-  validate_shadowtls_sni "$sni" || die "Invalid ShadowTLS SNI hostname: ${sni}"
-  validate_shadowtls_password "$password" || die "ShadowTLS password must use only letters, digits, dot, underscore or hyphen."
-  state_set SHADOWTLS_PORT "$public_port"
-  state_set SHADOWTLS_SNI "$sni"
-  state_set SHADOWTLS_PASSWORD "$password"
-  state_set SHADOWTLS_VERSION 3
-  state_set SHADOWTLS_ENABLED 1
-}
-
-configure_shadowtls_on_install() {
-  target_major="$1"
-  backend_port="$2"
-  if [ "$target_major" != "5" ]; then
-    SHADOWTLS_REQUESTED=0
-    export SHADOWTLS_REQUESTED
-    return 0
-  fi
-
-  current=0
-  shadowtls_enabled && current=1
-  if [ -n "${SHADOWTLS_ENABLE:-}" ]; then
-    enabled="$(normalize_bool_state "$SHADOWTLS_ENABLE" 2>/dev/null || true)"
-    [ -n "$enabled" ] || die "SHADOWTLS_ENABLE must be 0 or 1."
-  elif [ -t 0 ]; then
-    if [ "$current" = "1" ]; then prompt='Enable ShadowTLS v3 for Snell v5? [Y/n]: '; else prompt='Enable ShadowTLS v3 for Snell v5? [y/N]: '; fi
-    printf '%s' "$prompt"
-    read -r answer || answer=''
-    case "$answer" in
-      y|Y|yes|YES) enabled=1 ;;
-      n|N|no|NO) enabled=0 ;;
-      '') enabled="$current" ;;
-      *) enabled="$current" ;;
-    esac
-  else
-    enabled="$current"
-  fi
-
-  if [ "$enabled" != "1" ]; then
-    state_set SHADOWTLS_ENABLED 0
-    SHADOWTLS_REQUESTED=0
-    export SHADOWTLS_REQUESTED
-    return 0
-  fi
-
-  [ "$SNELL_ARCH" != "i386" ] || die "ShadowTLS support is unavailable on i386 in this script because the upstream release set does not publish the target used by the reference implementation. Install Snell v5 without ShadowTLS on i386."
-  suggested="$(suggest_shadowtls_port "$backend_port")"
-  public_port="${SHADOWTLS_PORT:-$(current_shadowtls_port)}"
-  [ -n "$public_port" ] || public_port="$suggested"
-  if [ -t 0 ] && [ -z "${SHADOWTLS_PORT:-}" ]; then
-    while :; do
-      printf 'ShadowTLS public TCP port [%s]: ' "$public_port"
-      read -r selected || die "Unable to read ShadowTLS port."
-      selected="$(trim_value "$selected")"
-      [ -n "$selected" ] || selected="$public_port"
-      if ! validate_port "$selected" || [ "$selected" = "$backend_port" ]; then
-        warn "Choose a free TCP port different from the Snell backend port ${backend_port}."
-        continue
-      fi
-      if ! shadowtls_public_port_available "$selected"; then
-        warn "TCP port ${selected} is already in use."
-        continue
-      fi
-      public_port="$selected"
-      break
-    done
-  fi
-
-  sni="${SHADOWTLS_SNI:-$(current_shadowtls_sni)}"
-  [ -n "$sni" ] || sni="$DEFAULT_SHADOWTLS_SNI"
-  if [ -t 0 ] && [ -z "${SHADOWTLS_SNI:-}" ]; then
-    while :; do
-      printf 'ShadowTLS SNI [%s]: ' "$sni"
-      read -r selected_sni || die "Unable to read ShadowTLS SNI."
-      selected_sni="$(trim_value "$selected_sni")"
-      [ -n "$selected_sni" ] || selected_sni="$sni"
-      if validate_shadowtls_sni "$selected_sni"; then sni="$selected_sni"; break; fi
-      warn "Enter a hostname such as www.icloud.com."
-    done
-  fi
-
-  password="${SHADOWTLS_PASSWORD:-$(current_shadowtls_password)}"
-  [ -n "$password" ] || password="$(random_shadowtls_password)"
-  set_shadowtls_details "$backend_port" "$public_port" "$sni" "$password"
-  SHADOWTLS_REQUESTED=1
-  export SHADOWTLS_REQUESTED
-  log "ShadowTLS v3 selected: public TCP/${public_port}, SNI ${sni}."
-}
-
-enable_shadowtls_kernel_tfo() {
-  sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
-  mkdir -p /etc/sysctl.d 2>/dev/null || true
-  printf '%s\n' 'net.ipv4.tcp_fastopen = 3' > /etc/sysctl.d/99-shadowtls-tfo.conf 2>/dev/null || true
-}
-
-install_shadowtls_openrc_service() {
-  shadowtls_enabled || return 0
-  backend_port="$(current_port)" || die "Cannot determine Snell backend port for ShadowTLS."
-  public_port="$(current_shadowtls_port)"
-  sni="$(current_shadowtls_sni)"
-  password="$(current_shadowtls_password)"
-  [ -x "$SHADOWTLS_BIN" ] || die "ShadowTLS binary is missing."
-  enable_shadowtls_kernel_tfo
-  touch "$SHADOWTLS_LOG"
-  cat > "$SHADOWTLS_INIT" <<EOF_STLS
+# 配置服务
+setupService(){
+	if command -v systemctl >/dev/null 2>&1 && systemctl show --property=Version >/dev/null 2>&1; then
+		if ! cat > /etc/systemd/system/snell-server.service <<'EOF'
+[Unit]
+Description=Snell Service
+After=network.target
+[Service]
+LimitNOFILE=32767
+Type=simple
+User=root
+Restart=on-failure
+RestartSec=5s
+ExecStart=/usr/local/bin/snell-server -c /etc/snell/config.conf
+[Install]
+WantedBy=multi-user.target
+EOF
+		then
+			echo -e "${Error} 无法创建 systemd 服务文件"
+			return 1
+		fi
+		if ! systemctl daemon-reload >/dev/null 2>&1 || ! systemctl enable snell-server >/dev/null 2>&1; then
+			echo -e "${Error} 无法注册 systemd 服务"
+			return 1
+		fi
+	elif [ -d /etc/init.d ] && command -v rc-update >/dev/null 2>&1; then
+		# Alpine/OpenRC：自定义 start/stop（gcompat 加载的进程名是 musl loader，
+		# start-stop-daemon --exec 进程名校验会失败，故直接 pid 管理）
+		cat > /etc/init.d/snell-server << 'EOF'
 #!/sbin/openrc-run
-name="ShadowTLS for Snell"
-description="ShadowTLS v3 frontend for Snell v5"
-export MONOIO_FORCE_LEGACY_DRIVER=1
-export RUST_LOG=info
-command="${SHADOWTLS_BIN}"
-command_args="--fastopen --v3 server --listen 0.0.0.0:${public_port} --server 127.0.0.1:${backend_port} --tls ${sni} --password ${password}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="${SHADOWTLS_LOG}"
-error_log="${SHADOWTLS_LOG}"
+name="snell-server"
+description="Snell Server"
+pidfile="/run/${RC_SVCNAME}.pid"
+logfile="/var/log/snell-server.log"
 
- depend() {
-    need net snell
-    after firewall snell
- }
-EOF_STLS
-  chmod 755 "$SHADOWTLS_INIT"
-  rc-update add "$SHADOWTLS_SERVICE" default >/dev/null 2>&1 || true
-}
-
-start_or_restart_shadowtls() {
-  shadowtls_service_exists || return 1
-  if rc-service "$SHADOWTLS_SERVICE" status >/dev/null 2>&1; then
-    rc-service "$SHADOWTLS_SERVICE" restart
-  else
-    rc-service "$SHADOWTLS_SERVICE" start
-  fi
-  sleep 1
-  rc-service "$SHADOWTLS_SERVICE" status >/dev/null 2>&1
-}
-
-stop_remove_shadowtls_service() {
-  if shadowtls_service_exists; then
-    rc-service "$SHADOWTLS_SERVICE" stop >/dev/null 2>&1 || true
-    rc-update del "$SHADOWTLS_SERVICE" default >/dev/null 2>&1 || true
-    rm -f "$SHADOWTLS_INIT"
-  fi
-}
-
-refresh_shadowtls_service_if_enabled() {
-  if shadowtls_enabled; then
-    install_shadowtls_openrc_service
-    start_or_restart_shadowtls || die "ShadowTLS failed to restart. Check ${SHADOWTLS_LOG}."
-  fi
-}
-
-show_shadowtls() {
-  printf '\nShadowTLS v3:\n'
-  if ! shadowtls_enabled; then
-    printf '  Status: disabled\n'
-    return 0
-  fi
-  public_port="$(current_shadowtls_port)"
-  sni="$(current_shadowtls_sni)"
-  password="$(current_shadowtls_password)"
-  release="$(state_get SHADOWTLS_RELEASE 2>/dev/null || true)"
-  if rc-service "$SHADOWTLS_SERVICE" status >/dev/null 2>&1; then svc=running; else svc=stopped; fi
-  printf '  Status:      enabled (%s)\n' "$svc"
-  printf '  Public port: %s/tcp\n' "$public_port"
-  printf '  SNI:         %s\n' "$sni"
-  printf '  Password:    %s\n' "$password"
-  printf '  Protocol:    v3\n'
-  printf '  Binary:      %s\n' "${release:-unknown}"
-}
-
-enable_shadowtls() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  [ "$major" = "5" ] || die "ShadowTLS integration in this script is supported for Snell v5 only."
-  ensure_dependencies
-  backend_port="$(current_port)" || die "Cannot determine Snell backend port."
-  SHADOWTLS_ENABLE=1
-  export SHADOWTLS_ENABLE
-  configure_shadowtls_on_install 5 "$backend_port"
-  download_shadowtls_binary
-  psk="$(conf_get psk)"
-  ipv6="$(current_ipv6_enabled)"
-  # state is enabled now, so this rewrites Snell to 127.0.0.1:<port>.
-  apply_config_change 5 "$backend_port" "$psk" "$ipv6" prefer-ipv4 default
-  install_shadowtls_openrc_service
-  if ! start_or_restart_shadowtls; then
-    warn "ShadowTLS failed to start; restoring direct Snell v5 listening."
-    state_set SHADOWTLS_ENABLED 0
-    apply_config_change 5 "$backend_port" "$psk" "$ipv6" prefer-ipv4 default || true
-    stop_remove_shadowtls_service
-    die "ShadowTLS enable failed. Check ${SHADOWTLS_LOG}."
-  fi
-  show_config
-}
-
-disable_shadowtls() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  [ "$major" = "5" ] || die "ShadowTLS integration in this script is supported for Snell v5 only."
-  backend_port="$(current_port)" || die "Cannot determine Snell backend port."
-  psk="$(conf_get psk)"
-  ipv6="$(current_ipv6_enabled)"
-  stop_remove_shadowtls_service
-  state_set SHADOWTLS_ENABLED 0
-  apply_config_change 5 "$backend_port" "$psk" "$ipv6" prefer-ipv4 default
-  log "ShadowTLS disabled; Snell v5 is directly exposed again."
-  show_config
-}
-
-update_shadowtls() {
-  shadowtls_enabled || die "ShadowTLS is not enabled."
-  ensure_dependencies
-  download_shadowtls_binary
-  install_shadowtls_openrc_service
-  start_or_restart_shadowtls || die "Updated ShadowTLS binary failed to start. Check ${SHADOWTLS_LOG}."
-  log "ShadowTLS updated."
-  show_shadowtls
-}
-
-shadowtls_menu() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  [ "$major" = "5" ] || { warn "ShadowTLS menu is available for Snell v5 only."; return 0; }
-  show_shadowtls
-  printf '%s\n' '1) Enable / reconfigure ShadowTLS v3'
-  printf '%s\n' '2) Disable ShadowTLS'
-  printf '%s\n' '3) Update ShadowTLS binary'
-  printf '%s\n' '4) Show ShadowTLS details'
-  printf '%s\n' '0) Back'
-  printf 'Select: '
-  read -r c || return 0
-  case "$c" in
-    1) enable_shadowtls ;;
-    2) disable_shadowtls ;;
-    3) update_shadowtls ;;
-    4) show_shadowtls ;;
-    0) return 0 ;;
-    *) warn "Invalid selection." ;;
-  esac
-}
-
-validate_mode() {
-  case "$1" in
-    default|unshaped) return 0 ;;
-    unsafe-raw)
-      [ "${ALLOW_UNSAFE_RAW:-0}" = "1" ] || return 2
-      return 0
-      ;;
-    *) return 1 ;;
-  esac
-}
-
-validate_dns() {
-  case "$1" in
-    default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-listen_from_port_ipv6() {
-  port="$1"
-  ipv6="$2"
-  if [ "$ipv6" = "1" ]; then
-    printf '0.0.0.0:%s,[::]:%s\n' "$port" "$port"
-  else
-    printf '0.0.0.0:%s\n' "$port"
-  fi
-}
-
-current_ipv6_enabled() {
-  major="$(current_snell_major 2>/dev/null || printf '6')"
-  if [ "$major" = "5" ]; then
-    value="$(conf_get ipv6 2>/dev/null || printf 'false')"
-    case "$value" in
-      true|1|yes|on) printf '1\n' ;;
-      *) printf '0\n' ;;
+is_snell_pid() {
+    local pid="$1"
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
     esac
-    return 0
-  fi
-
-  listen="$(conf_get listen 2>/dev/null || true)"
-  case "$listen" in
-    *'[::]:'*) printf '1\n' ;;
-    *) printf '0\n' ;;
-  esac
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q 'snell-server'
 }
 
-current_port() {
-  listen="$(conf_get listen 2>/dev/null || true)"
-  first_listen="$(printf '%s' "$listen" | cut -d, -f1 | tr -d '[:space:]')"
-  port="$(printf '%s' "$first_listen" | sed -n 's/^.*:\([0-9][0-9]*\)$/\1/p')"
-  [ -n "$port" ] || return 1
-  printf '%s\n' "$port"
-}
-
-write_config_v5() {
-  port="$1"
-  psk="$2"
-  ipv6="$3"
-  if [ "$ipv6" = "1" ]; then ipv6_value=true; else ipv6_value=false; fi
-  bind_host="0.0.0.0"
-  if shadowtls_enabled; then
-    bind_host="127.0.0.1"
-  fi
-
-  mkdir -p "$CONF_DIR"
-  chmod 700 "$CONF_DIR"
-  umask 077
-  tmp="${CONF_FILE}.tmp.$$"
-  cat > "$tmp" <<EOF_CONFIG
-[snell-server]
-listen = ${bind_host}:${port}
-psk = ${psk}
-ipv6 = ${ipv6_value}
-EOF_CONFIG
-  chmod 600 "$tmp"
-  mv "$tmp" "$CONF_FILE"
-}
-
-write_config_v6() {
-  port="$1"
-  psk="$2"
-  ipv6="$3"
-  dns_pref="$4"
-  mode="$5"
-  listen="$(listen_from_port_ipv6 "$port" "$ipv6")"
-
-  mkdir -p "$CONF_DIR"
-  chmod 700 "$CONF_DIR"
-  umask 077
-  tmp="${CONF_FILE}.tmp.$$"
-  cat > "$tmp" <<EOF_CONFIG
-[snell-server]
-listen = ${listen}
-psk = ${psk}
-dns-ip-preference = ${dns_pref}
-mode = ${mode}
-EOF_CONFIG
-  chmod 600 "$tmp"
-  mv "$tmp" "$CONF_FILE"
-}
-
-write_config_for_major() {
-  major="$1"
-  port="$2"
-  psk="$3"
-  ipv6="$4"
-  dns_pref="${5:-prefer-ipv4}"
-  mode="${6:-default}"
-  case "$major" in
-    5) write_config_v5 "$port" "$psk" "$ipv6" ;;
-    6) write_config_v6 "$port" "$psk" "$ipv6" "$dns_pref" "$mode" ;;
-    *) die "Unsupported Snell major version: ${major}" ;;
-  esac
-}
-
-create_install_config() {
-  target_major="$1"
-  old_major="$(current_snell_major 2>/dev/null || true)"
-
-  old_port="$(current_port 2>/dev/null || true)"
-  port="${PORT:-${old_port:-}}"
-  [ -n "$port" ] || port="$(random_port "$target_major")"
-  validate_port "$port" || die "PORT must be an integer from 1 to 65535."
-
-  old_psk="$(conf_get psk 2>/dev/null || true)"
-  psk="${PSK:-${old_psk:-$(random_psk)}}"
-  [ -n "$psk" ] || die "PSK cannot be empty."
-
-  if [ -n "${ENABLE_IPV6:-}" ]; then
-    ipv6="$ENABLE_IPV6"
-  elif [ -n "$old_major" ] && [ "$old_major" = "$target_major" ]; then
-    ipv6="$(current_ipv6_enabled 2>/dev/null || printf '0')"
-  else
-    ipv6=0
-  fi
-  case "$ipv6" in 0|1) ;; *) die "ENABLE_IPV6 must be 0 or 1." ;; esac
-
-  if [ "$target_major" = "6" ]; then
-    if [ "$old_major" = "6" ]; then
-      old_mode="$(conf_get mode 2>/dev/null || printf 'default')"
-      old_dns="$(conf_get dns-ip-preference 2>/dev/null || printf 'prefer-ipv4')"
-    else
-      old_mode=default
-      old_dns=prefer-ipv4
+start() {
+    ebegin "Starting ${name}"
+    if [ -f "$pidfile" ]; then
+        pid=$(cat "$pidfile" 2>/dev/null)
+        if kill -0 "$pid" 2>/dev/null && is_snell_pid "$pid"; then
+            eend 0 "already running"
+            return 0
+        fi
+        rm -f "$pidfile"
     fi
-    mode="${MODE:-$old_mode}"
-    if validate_mode "$mode"; then
-      :
+    setsid /usr/local/bin/snell-server -c /etc/snell/config.conf >>"$logfile" 2>&1 &
+    pid=$!
+    echo "$pid" > "$pidfile"
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null && is_snell_pid "$pid"; then
+        eend 0
     else
-      rc=$?
-      if [ "$rc" -eq 2 ]; then
-        die "unsafe-raw disables encryption. Set ALLOW_UNSAFE_RAW=1 only if you intentionally want it."
-      fi
-      die "Invalid MODE: ${mode}"
+        rm -f "$pidfile"
+        eend 1
+        return 1
     fi
-    dns_pref="${DNS_PREFERENCE:-$old_dns}"
-    validate_dns "$dns_pref" || die "Invalid DNS_PREFERENCE: ${dns_pref}"
-    write_config_v6 "$port" "$psk" "$ipv6" "$dns_pref" "$mode"
-  else
-    write_config_v5 "$port" "$psk" "$ipv6"
-  fi
-
-  if [ -n "$old_major" ] && [ "$old_major" != "$target_major" ]; then
-    log "Converted server configuration from Snell v${old_major} to v${target_major}."
-  else
-    log "Prepared Snell v${target_major} configuration at ${CONF_FILE}."
-  fi
 }
 
-resolve_download_url() {
-  major="$1"
-  validate_snell_major "$major" || die "Invalid Snell major version: ${major}"
-
-  if [ -n "${SNELL_URL:-}" ]; then
-    url="$SNELL_URL"
-  else
-    log "Resolving current Snell v${major} download from Surge..." >&2
-    page="$(curl -fsSL --retry 3 --connect-timeout 10 "$RELEASE_PAGE")" || die "Unable to fetch the official Snell release page."
-    url="$(printf '%s\n' "$page" \
-      | grep -Eo "https://dl\\.nssurge\\.com/snell/snell-server-v${major}[^[:space:]\"'<>)]*-linux-${SNELL_ARCH}\\.zip" \
-      | tail -n 1 || true)"
-    [ -n "$url" ] || die "Could not find a Snell v${major} package for ${SNELL_ARCH}. Set SNELL_URL manually if Surge changed the release-page format."
-  fi
-
-  case "$url" in
-    https://dl.nssurge.com/snell/snell-server-v"${major}"*-linux-"${SNELL_ARCH}".zip) ;;
-    *) die "Refusing unexpected Snell v${major} download URL: ${url}" ;;
-  esac
-  printf '%s\n' "$url"
+stop() {
+    ebegin "Stopping ${name}"
+    pid=""
+    [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null && is_snell_pid "$pid"; then
+        kill "$pid" 2>/dev/null
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 5 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$pidfile"
+    eend 0
 }
 
-extract_version_from_url() {
-  url="$1"
-  basename "$url" | sed -n 's/^snell-server-\(v[56][^-]*\)-linux-.*\.zip$/\1/p'
+status() {
+    pid=""
+    [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null && is_snell_pid "$pid"; then
+        ebegin "${name} is running (pid ${pid})"
+        eend 0
+        return 0
+    fi
+    ebegin "${name} is stopped"
+    eend 1
 }
-
-check_binary_compat() {
-  file="$1"
-  output="$($file --help 2>&1 || true)"
-  case "$output" in
-    *"not found"*|*"Error loading shared library"*|*"symbol not found"*)
-      printf '%s\n' "$output" >&2
-      return 1
-      ;;
-  esac
-  return 0
-}
-
-download_binary_to() {
-  destination="$1"
-  major="$2"
-  url="$(resolve_download_url "$major")"
-  version="$(extract_version_from_url "$url")"
-  [ -n "$version" ] || version="v${major} (unknown build)"
-
-  log "Downloading ${version}: ${url}"
-  tmp_dir="$(mktemp -d)"
-  curl -fL --retry 3 --connect-timeout 10 "$url" -o "$tmp_dir/snell.zip"
-  unzip -oq "$tmp_dir/snell.zip" -d "$tmp_dir/unpack"
-  src="$(find "$tmp_dir/unpack" -type f -name snell-server -print | head -n 1)"
-  [ -n "$src" ] || { rm -rf "$tmp_dir"; die "snell-server was not found in the downloaded archive."; }
-
-  cp "$src" "$destination"
-  chmod 755 "$destination"
-  if ! check_binary_compat "$destination"; then
-    rm -f "$destination"
-    rm -rf "$tmp_dir"
-    die "The Snell v${major} binary could not run with Alpine ${ALPINE_VERSION} and the available glibc compatibility layer (${GLIBC_COMPAT:-unknown})."
-  fi
-  rm -rf "$tmp_dir"
-  printf '%s\n' "$version" > "${destination}.version"
-}
-
-install_openrc_service() {
-  major="$1"
-  touch "$LOG_FILE"
-  cat > "$INIT_FILE" <<EOF_INIT
-#!/sbin/openrc-run
-
-name="Snell Server"
-description="Snell v${major} Proxy Server"
-command="/usr/local/bin/snell-server"
-command_args="-c /etc/snell/snell-server.conf"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/snell.log"
-error_log="/var/log/snell.log"
 
 depend() {
     need net
-    after firewall
 }
-EOF_INIT
-  chmod 755 "$INIT_FILE"
-  rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-}
-
-start_or_restart() {
-  if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-    rc-service "$SERVICE_NAME" restart
-  else
-    rc-service "$SERVICE_NAME" start
-  fi
-  sleep 1
-  if ! rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-    tail -n 50 "$LOG_FILE" 2>/dev/null || true
-    return 1
-  fi
-  return 0
+EOF
+		if ! chmod +x /etc/init.d/snell-server || ! rc-update add snell-server default >/dev/null 2>&1; then
+			echo -e "${Error} 无法注册 OpenRC 服务"
+			return 1
+		fi
+	else
+		echo -e "${Error} 未找到可用的服务管理器（systemd/OpenRC）"
+		return 1
+	fi
 }
 
-installed_version() {
-  if [ -s "${BIN_FILE}.version" ]; then
-    cat "${BIN_FILE}.version"
-    return 0
-  fi
-  if binary_exists; then
-    out="$($BIN_FILE --help 2>&1 || true)"
-    printf '%s\n' "$out" | sed -n 's/.*\(v[56]\.[0-9][^[:space:]]*\).*/\1/p' | head -n 1
-  fi
+# ============================== ShadowTLS ==============================
+# ShadowTLS 作为 Snell 的 TCP 前置层：公网 -> ShadowTLS -> 127.0.0.1:Snell
+shadowTLSConfigured(){
+    [ -x "${shadowtls_bin}" ] && [ -f "${shadowtls_conf}" ]
 }
 
-install_snell() {
-  select_snell_major_on_install
-  target_major="$TARGET_MAJOR"
-  first_install=0
-  config_exists || first_install=1
-
-  ensure_dependencies
-  ensure_server_host
-  configure_port_on_install "$target_major"
-  configure_shadowtls_on_install "$target_major" "$PORT"
-  if [ "$first_install" = "1" ]; then
-    configure_system_dns_on_install
-    configure_tfo_on_install
-  elif [ -n "${CLIENT_TFO:-}" ]; then
-    set_client_tfo "$CLIENT_TFO"
-  fi
-  if [ "$target_major" = "5" ] && shadowtls_enabled; then
-    download_shadowtls_binary
-  fi
-
-  config_backup="${CONF_FILE}.install.bak.$$"
-  had_config=0
-  if config_exists; then
-    had_config=1
-    cp "$CONF_FILE" "$config_backup"
-    chmod 600 "$config_backup"
-  fi
-  create_install_config "$target_major"
-
-  tmp_bin="${BIN_FILE}.new.$$"
-  backup_bin="${BIN_FILE}.bak.$$"
-  backup_ver="${BIN_FILE}.version.bak.$$"
-  had_binary=0
-  rm -f "$tmp_bin" "${tmp_bin}.version" "$backup_bin" "$backup_ver"
-  download_binary_to "$tmp_bin" "$target_major"
-
-  if binary_exists; then
-    had_binary=1
-    cp "$BIN_FILE" "$backup_bin"
-    [ -f "${BIN_FILE}.version" ] && cp "${BIN_FILE}.version" "$backup_ver" || true
-  fi
-
-  mv "$tmp_bin" "$BIN_FILE"
-  if [ -f "${tmp_bin}.version" ]; then
-    mv "${tmp_bin}.version" "${BIN_FILE}.version"
-  fi
-  chmod 755 "$BIN_FILE"
-  install_openrc_service "$target_major"
-
-  if ! start_or_restart; then
-    warn "Snell v${target_major} failed to start; rolling back."
-    if [ "$had_binary" = "1" ]; then
-      mv "$backup_bin" "$BIN_FILE"
-      if [ -f "$backup_ver" ]; then
-        mv "$backup_ver" "${BIN_FILE}.version"
-      else
-        rm -f "${BIN_FILE}.version"
-      fi
-      chmod 755 "$BIN_FILE"
-    else
-      rm -f "$BIN_FILE" "${BIN_FILE}.version"
-    fi
-    if [ "$had_config" = "1" ]; then
-      mv "$config_backup" "$CONF_FILE"
-    else
-      rm -f "$CONF_FILE" "$config_backup"
-    fi
-    if [ "$had_binary" = "1" ]; then
-      old_major="$(installed_major_from_version 2>/dev/null || true)"
-      [ -n "$old_major" ] && install_openrc_service "$old_major" || true
-      start_or_restart || true
-    fi
-    die "Install/repair failed; previous binary/configuration were restored when available."
-  fi
-
-  state_set SNELL_MAJOR "$target_major"
-
-  if [ "$target_major" = "5" ] && shadowtls_enabled; then
-    install_shadowtls_openrc_service
-    if ! start_or_restart_shadowtls; then
-      warn "ShadowTLS failed to start. Falling back to direct Snell v5 so the server stays reachable."
-      stop_remove_shadowtls_service
-      state_set SHADOWTLS_ENABLED 0
-      psk_now="$(conf_get psk)"
-      ipv6_now="$(current_ipv6_enabled)"
-      write_config_v5 "$PORT" "$psk_now" "$ipv6_now"
-      start_or_restart || true
-      die "Snell v5 installed, but ShadowTLS setup failed. Check ${SHADOWTLS_LOG}."
-    fi
-  elif [ "$target_major" = "6" ]; then
-    stop_remove_shadowtls_service
-    state_set SHADOWTLS_ENABLED 0
-  fi
-
-  rm -f "$backup_bin" "$backup_ver" "$config_backup"
-  log "Snell v${target_major} installation completed."
-  if [ "$target_major" = "5" ]; then
-    if shadowtls_enabled; then
-      warn "ShadowTLS is TCP-only. The generated Surge policy sets block-quic=true. Normal UDP still works through Snell v5 UDP-over-TCP."
-    else
-      warn "Snell v5 QUIC Proxy Mode uses UDP on the same port. Allow both TCP/${PORT} and UDP/${PORT} in your VPS/cloud firewall."
-    fi
-  fi
-  show_config
-}
-
-update_snell() {
-  binary_exists || die "Snell is not installed. Run: $0 install"
-  major="$(current_snell_major 2>/dev/null || true)"
-  validate_snell_major "$major" || die "Cannot determine whether the installed server is Snell v5 or v6. Re-run: $0 install"
-  if [ "$major" = "6" ] && [ "$SNELL_ARCH" = "armv7l" ]; then
-    die "Official Snell v6 does not provide an armv7l package."
-  fi
-  ensure_dependencies
-
-  tmp_bin="${BIN_FILE}.new.$$"
-  backup_bin="${BIN_FILE}.bak.$$"
-  backup_ver="${BIN_FILE}.version.bak.$$"
-  rm -f "$tmp_bin" "${tmp_bin}.version" "$backup_bin" "$backup_ver"
-
-  download_binary_to "$tmp_bin" "$major"
-  new_version="$(cat "${tmp_bin}.version" 2>/dev/null || true)"
-  old_version="$(installed_version 2>/dev/null || true)"
-
-  cp "$BIN_FILE" "$backup_bin"
-  [ -f "${BIN_FILE}.version" ] && cp "${BIN_FILE}.version" "$backup_ver" || true
-
-  mv "$tmp_bin" "$BIN_FILE"
-  if [ -f "${tmp_bin}.version" ]; then
-    mv "${tmp_bin}.version" "${BIN_FILE}.version"
-  fi
-  chmod 755 "$BIN_FILE"
-  install_openrc_service "$major"
-
-  if ! start_or_restart; then
-    warn "New binary failed to start; rolling back."
-    mv "$backup_bin" "$BIN_FILE"
-    if [ -f "$backup_ver" ]; then
-      mv "$backup_ver" "${BIN_FILE}.version"
-    else
-      rm -f "${BIN_FILE}.version"
-    fi
-    chmod 755 "$BIN_FILE"
-    start_or_restart || true
-    die "Update failed and the previous binary was restored."
-  fi
-
-  state_set SNELL_MAJOR "$major"
-  rm -f "$backup_bin" "$backup_ver"
-  if [ -n "$old_version" ] && [ "$old_version" = "$new_version" ]; then
-    log "Reinstalled ${new_version}; it was already the current resolved v${major} build."
-  else
-    log "Updated Snell v${major}: ${old_version:-unknown} -> ${new_version:-unknown}."
-  fi
-}
-
-require_config() {
-  config_exists || die "Snell configuration not found. Run: $0 install"
-}
-
-apply_config_change() {
-  major="$1"
-  port="$2"
-  psk="$3"
-  ipv6="$4"
-  dns_pref="${5:-prefer-ipv4}"
-  mode="${6:-default}"
-  backup="${CONF_FILE}.bak.$$"
-
-  cp "$CONF_FILE" "$backup"
-  chmod 600 "$backup"
-  write_config_for_major "$major" "$port" "$psk" "$ipv6" "$dns_pref" "$mode"
-
-  if service_exists && binary_exists; then
-    if ! start_or_restart; then
-      warn "New configuration failed; restoring the previous configuration."
-      mv "$backup" "$CONF_FILE"
-      chmod 600 "$CONF_FILE"
-      start_or_restart || true
-      die "Configuration change was rolled back. Check: tail -n 100 ${LOG_FILE}"
-    fi
-  else
-    warn "Configuration updated, but the Snell service is not installed."
-  fi
-  rm -f "$backup"
-}
-
-change_port() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  validate_snell_major "$major" || die "Cannot determine installed Snell version."
-  port="$1"
-  validate_port "$port" || die "Port must be an integer from 1 to 65535."
-  old_port="$(current_port 2>/dev/null || true)"
-  if [ "$port" != "$old_port" ] && port_in_use_for_major "$port" "$major"; then
-    if [ "$major" = "5" ]; then
-      die "TCP or UDP port ${port} is already in use."
-    fi
-    die "TCP port ${port} is already in use."
-  fi
-
-  ipv6="$(current_ipv6_enabled)"
-  psk="$(conf_get psk)"
-  dns_pref="$(conf_get dns-ip-preference 2>/dev/null || printf 'prefer-ipv4')"
-  mode="$(conf_get mode 2>/dev/null || printf 'default')"
-  apply_config_change "$major" "$port" "$psk" "$ipv6" "$dns_pref" "$mode"
-  if [ "$major" = "5" ] && shadowtls_enabled; then
-    refresh_shadowtls_service_if_enabled
-  fi
-  log "Port changed: ${old_port:-unknown} -> ${port}."
-  if [ "$major" = "5" ]; then
-    if shadowtls_enabled; then
-      warn "This changed the private Snell backend port. Clients continue using ShadowTLS TCP/$(current_shadowtls_port)."
-    else
-      warn "Remember to allow both TCP/${port} and UDP/${port} for Snell v5 QUIC Proxy Mode."
-    fi
-  fi
-  show_config
-}
-
-change_psk() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  validate_snell_major "$major" || die "Cannot determine installed Snell version."
-  new_psk="${1:-}"
-  [ -n "$new_psk" ] || new_psk="$(random_psk)"
-  [ -n "$new_psk" ] || die "PSK cannot be empty."
-
-  port="$(current_port)"
-  ipv6="$(current_ipv6_enabled)"
-  dns_pref="$(conf_get dns-ip-preference 2>/dev/null || printf 'prefer-ipv4')"
-  mode="$(conf_get mode 2>/dev/null || printf 'default')"
-  apply_config_change "$major" "$port" "$new_psk" "$ipv6" "$dns_pref" "$mode"
-  log "PSK has been reset."
-  show_config
-}
-
-change_mode() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  [ "$major" = "6" ] || die "The mode option is Snell v6 only. Snell v5 does not use v6 transport modes."
-  mode="$1"
-  if validate_mode "$mode"; then
-    :
-  else
-    rc=$?
-    if [ "$rc" -eq 2 ]; then
-      die "unsafe-raw disables encryption. Re-run with ALLOW_UNSAFE_RAW=1 if this is intentional."
-    fi
-    die "Invalid mode: ${mode}"
-  fi
-
-  port="$(current_port)"
-  ipv6="$(current_ipv6_enabled)"
-  psk="$(conf_get psk)"
-  dns_pref="$(conf_get dns-ip-preference 2>/dev/null || printf 'prefer-ipv4')"
-  apply_config_change 6 "$port" "$psk" "$ipv6" "$dns_pref" "$mode"
-  log "Mode changed to ${mode}."
-  show_config
-}
-
-change_dns() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  [ "$major" = "6" ] || die "dns-ip-preference is a Snell v6 server option. For v5, use the Alpine local DNS menu/command."
-  dns_pref="$1"
-  validate_dns "$dns_pref" || die "Invalid DNS preference: ${dns_pref}"
-
-  port="$(current_port)"
-  ipv6="$(current_ipv6_enabled)"
-  psk="$(conf_get psk)"
-  mode="$(conf_get mode 2>/dev/null || printf 'default')"
-  apply_config_change 6 "$port" "$psk" "$ipv6" "$dns_pref" "$mode"
-  log "DNS preference changed to ${dns_pref}."
-  show_config
-}
-
-toggle_ipv6() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  validate_snell_major "$major" || die "Cannot determine installed Snell version."
-  state="$1"
-  case "$state" in
-    on|1|enable|enabled) ipv6=1 ;;
-    off|0|disable|disabled) ipv6=0 ;;
-    *) die "Use: ipv6 on|off" ;;
-  esac
-
-  port="$(current_port)" || die "Could not parse the current listen port."
-  psk="$(conf_get psk)"
-  dns_pref="$(conf_get dns-ip-preference 2>/dev/null || printf 'prefer-ipv4')"
-  mode="$(conf_get mode 2>/dev/null || printf 'default')"
-  apply_config_change "$major" "$port" "$psk" "$ipv6" "$dns_pref" "$mode"
-  if [ "$major" = "5" ]; then
-    if [ "$ipv6" = "1" ]; then
-      log "Snell v5 outbound IPv6 support enabled."
-    else
-      log "Snell v5 outbound IPv6 support disabled."
-    fi
-  else
-    if [ "$ipv6" = "1" ]; then
-      log "Snell v6 IPv6 listening enabled."
-    else
-      log "Snell v6 IPv6 listening disabled."
-    fi
-  fi
-  show_config
-}
-
-show_config() {
-  require_config
-  major="$(current_snell_major 2>/dev/null || true)"
-  validate_snell_major "$major" || major="unknown"
-  listen="$(conf_get listen)"
-  psk="$(conf_get psk)"
-  tfo="$(current_client_tfo)"
-  port="$(current_port 2>/dev/null || true)"
-  version="$(installed_version 2>/dev/null || true)"
-  host="$(current_server_host)"
-  [ -n "$host" ] || host="YOUR_SERVER_IP"
-  client_host="$(format_client_host "$host")"
-  system_dns="$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {if (out != "") out=out ", "; out=out $2} END {print out}' "$RESOLV_CONF" 2>/dev/null || true)"
-  [ -n "$system_dns" ] || system_dns="none"
-
-  if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-    svc_status="running"
-  else
-    svc_status="stopped"
-  fi
-
-  printf '\n%s\n' '========================================'
-  printf ' Snell v%s status / configuration\n' "$major"
-  printf '%s\n' '========================================'
-  printf 'Alpine:       %s\n' "${ALPINE_VERSION:-$(cat /etc/alpine-release 2>/dev/null || printf unknown)}"
-  printf 'Architecture: %s\n' "${SNELL_ARCH:-unknown}"
-  printf 'Version:      %s\n' "${version:-unknown}"
-  printf 'Service:      %s\n' "$svc_status"
-  printf 'Listen:       %s\n' "$listen"
-  printf 'PSK:          %s\n' "$psk"
-  printf 'Server:       %s\n' "$host"
-  printf 'Alpine DNS:   %s\n' "$system_dns"
-
-  if [ "$major" = "6" ]; then
-    dns_pref="$(conf_get dns-ip-preference 2>/dev/null || printf 'default')"
-    mode="$(conf_get mode 2>/dev/null || printf 'default')"
-    printf 'DNS pref:     %s\n' "$dns_pref"
-    printf 'Mode:         %s\n' "$mode"
-    if [ "$(current_ipv6_enabled)" = "1" ]; then
-      printf '%s\n' 'IPv6 listen:  enabled'
-    else
-      printf '%s\n' 'IPv6 listen:  disabled'
-    fi
-  elif [ "$major" = "5" ]; then
-    ipv6_value="$(conf_get ipv6 2>/dev/null || printf 'false')"
-    printf 'IPv6 outbound:%s\n' " ${ipv6_value}"
-    if shadowtls_enabled; then
-      stls_port="$(current_shadowtls_port)"
-      stls_sni="$(current_shadowtls_sni)"
-      stls_release="$(state_get SHADOWTLS_RELEASE 2>/dev/null || true)"
-      if rc-service "$SHADOWTLS_SERVICE" status >/dev/null 2>&1; then stls_status=running; else stls_status=stopped; fi
-      printf 'ShadowTLS:    enabled (%s)\n' "$stls_status"
-      printf 'TLS port:     %s/tcp\n' "$stls_port"
-      printf 'TLS SNI:      %s\n' "$stls_sni"
-      printf 'TLS release:  %s\n' "${stls_release:-unknown}"
-      printf '%s\n' 'QUIC Proxy:   blocked (block-quic=true; ShadowTLS is TCP-only)'
-      printf '%s\n' 'Normal UDP:   supported via Snell UDP-over-TCP'
-    else
-      printf '%s\n' 'ShadowTLS:    disabled'
-      printf '%s\n' 'QUIC Proxy:   enabled by protocol (UDP same port required)'
-    fi
-  fi
-
-  if [ "$tfo" = "1" ]; then
-    printf '%s\n' 'Surge TFO:    enabled'
-  else
-    printf '%s\n' 'Surge TFO:    disabled'
-  fi
-  printf 'Config:       %s\n' "$CONF_FILE"
-  printf 'Log:          %s\n' "$LOG_FILE"
-
-  if [ -n "$port" ]; then
-    printf '\nSurge configuration:\n'
-    if [ "$major" = "5" ]; then
-      if shadowtls_enabled; then
-        stls_port="$(current_shadowtls_port)"
-        stls_sni="$(current_shadowtls_sni)"
-        stls_password="$(current_shadowtls_password)"
-        # ShadowTLS is TCP-only, so Snell v5 QUIC Proxy Mode must be blocked.
-        # Other UDP traffic remains supported by Snell v5 via UDP-over-TCP.
-        printf 'Snell-v5-TLS = snell, %s, %s, psk=%s, version=5, reuse=true, block-quic=true' "$client_host" "$stls_port" "$psk"
-        if [ "$tfo" = "1" ]; then printf '%s' ', tfo=true'; fi
-        printf ', shadow-tls-password=%s, shadow-tls-sni=%s, shadow-tls-version=3\n' "$stls_password" "$stls_sni"
-        printf 'Firewall: allow TCP/%s only. Raw Snell is bound to 127.0.0.1:%s; QUIC is blocked, normal UDP remains available through Snell UDP-over-TCP.\n' "$stls_port" "$port"
-      else
-        printf 'Snell-v5 = snell, %s, %s, psk=%s, version=5, block-quic=off' "$client_host" "$port" "$psk"
-        if [ "$tfo" = "1" ]; then printf '%s' ', tfo=true'; fi
-        printf '\n'
-        printf 'Firewall: allow TCP/%s and UDP/%s for v5 QUIC Proxy Mode.\n' "$port" "$port"
-      fi
-    elif [ "$major" = "6" ]; then
-      mode="$(conf_get mode 2>/dev/null || printf 'default')"
-      printf 'Snell-v6 = snell, %s, %s, psk=%s, version=6' "$client_host" "$port" "$psk"
-      if [ "$mode" != "default" ]; then printf ', mode=%s' "$mode"; fi
-      if [ "$tfo" = "1" ]; then printf '%s' ', tfo=true'; fi
-      printf '\n'
-    fi
-  fi
-  printf '%s\n\n' '========================================'
-}
-
-service_action() {
-  action="$1"
-  service_exists || die "OpenRC service is not installed."
-  case "$action" in
-    start)
-      rc-service "$SERVICE_NAME" start
-      if shadowtls_enabled; then rc-service "$SHADOWTLS_SERVICE" start || true; fi
-      ;;
-    stop)
-      if shadowtls_enabled; then rc-service "$SHADOWTLS_SERVICE" stop >/dev/null 2>&1 || true; fi
-      rc-service "$SERVICE_NAME" stop
-      ;;
-    restart)
-      rc-service "$SERVICE_NAME" restart
-      if shadowtls_enabled; then rc-service "$SHADOWTLS_SERVICE" restart || true; fi
-      ;;
-    status)
-      rc-service "$SERVICE_NAME" status
-      if shadowtls_enabled; then rc-service "$SHADOWTLS_SERVICE" status || true; fi
-      ;;
-    *) die "Unsupported service action: ${action}" ;;
-  esac
-}
-
-show_logs() {
-  [ -f "$LOG_FILE" ] || die "Log file does not exist: ${LOG_FILE}"
-  printf '%s\n' '--- Snell log ---'
-  tail -n 100 "$LOG_FILE"
-  if shadowtls_enabled && [ -f "$SHADOWTLS_LOG" ]; then
-    printf '\n%s\n' '--- ShadowTLS log ---'
-    tail -n 100 "$SHADOWTLS_LOG"
-  fi
-}
-
-uninstall_snell() {
-  assume_yes="${1:-}"
-  if [ "$assume_yes" != "--yes" ]; then
-    if [ -t 0 ]; then
-      printf 'This will remove Snell, its service, configuration and log. Continue? [y/N]: '
-      read -r answer
-      case "$answer" in y|Y|yes|YES) ;; *) log "Cancelled."; return 0 ;; esac
-    else
-      die "Non-interactive uninstall requires --yes."
-    fi
-  fi
-
-  stop_remove_shadowtls_service
-  if service_exists; then
-    rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-    rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
-  fi
-  if [ -f "$DNS_BACKUP_FILE" ]; then
-    warn "Restoring the DNS configuration saved before Snell manager changed it."
-    restore_system_dns || true
-  fi
-  rm -f "$INIT_FILE" "$BIN_FILE" "${BIN_FILE}.version" "$LOG_FILE" "$SHADOWTLS_BIN" "$SHADOWTLS_LOG"
-  rm -rf "$CONF_DIR"
-  log "Snell has been uninstalled."
-}
-
-print_help() {
-  cat <<EOF_HELP
-Snell v5/v6 manager for Alpine Linux (no hard version limit; optional ShadowTLS v3 for v5)
-
-Usage:
-  $0                       Interactive menu
-  $0 install [5|6]         Install/repair Snell and optionally select v5 or v6
-  $0 update                Update the currently installed Snell major version
-  $0 show                  Show current configuration and Surge line
-  $0 port <1-65535>        Change listen port
-  $0 psk [new_psk]         Reset PSK (random if omitted)
-  $0 mode <mode>           v6 only: default | unshaped | unsafe-raw
-  $0 dns <preference>      v6 only: Snell DNS preference: default | prefer-ipv4 | prefer-ipv6 | ipv4-only | ipv6-only
-  $0 host <IP-or-domain>   Save/change the public IP or domain used in Surge output
-  $0 local-dns show        Show Alpine /etc/resolv.conf DNS servers
-  $0 local-dns set <IP...> Set 1-3 Alpine system DNS server IPs
-  $0 local-dns restore     Restore DNS backed up before the first change
-  $0 ipv6 on|off           v6: inbound IPv6; v5: outbound IPv6
-  $0 tfo on|off            Enable/disable Surge client TCP Fast Open output
-  $0 shadowtls enable       v5 only: install/reconfigure ShadowTLS v3 frontend
-  $0 shadowtls disable      v5 only: disable ShadowTLS and expose Snell directly
-  $0 shadowtls update       Update ShadowTLS binary and restart it
-  $0 shadowtls show         Show ShadowTLS details
-  $0 start|stop|restart    Control service
-  $0 status                Show OpenRC service status
-  $0 logs                  Show last 100 log lines
-  $0 uninstall [--yes]     Remove Snell completely
-  $0 help                  Show this help
-
-Install environment variables:
-  SNELL_VERSION=5|6, PORT, PSK, MODE(v6), DNS_PREFERENCE(v6), ENABLE_IPV6, SERVER_HOST, LOCAL_DNS, CLIENT_TFO, SNELL_URL
-  SHADOWTLS_ENABLE=0|1, SHADOWTLS_PORT, SHADOWTLS_SNI, SHADOWTLS_PASSWORD, SHADOWTLS_URL, SHADOWTLS_RELEASE_VERSION
-EOF_HELP
-}
-
-pause_menu() {
-  printf '\nPress Enter to continue...'
-  read -r _unused || true
-}
-
-interactive_menu() {
-  while :; do
-    clear 2>/dev/null || true
-    printf '%s\n' '========================================'
-    printf ' Snell v5/v6 Manager - Alpine %s\n' "${ALPINE_VERSION:-unknown}"
-    printf '%s\n' '========================================'
-    if binary_exists; then
-      ver="$(installed_version 2>/dev/null || true)"
-      printf 'Installed: %s\n' "${ver:-yes}"
-    else
-      printf '%s\n' 'Installed: no'
-    fi
-    if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-      printf '%s\n' 'Service:   running'
-    else
-      printf '%s\n' 'Service:   stopped / not installed'
-    fi
-    printf '%s\n' '----------------------------------------'
-    printf '%s\n' '1) Install / repair'
-    printf '%s\n' '2) Update installed Snell version'
-    printf '%s\n' '3) Show configuration'
-    printf '%s\n' '4) Change server IP / domain'
-    printf '%s\n' '5) Change port'
-    printf '%s\n' '6) Reset PSK'
-    printf '%s\n' '7) Change mode (v6 only)'
-    printf '%s\n' '8) Change Snell DNS preference (v6 only)'
-    printf '%s\n' '9) Set / restore Alpine local DNS'
-    printf '%s\n' '10) Toggle Surge TCP Fast Open (TFO)'
-    printf '%s\n' '11) ShadowTLS v3 management (v5 only)'
-    printf '%s\n' '12) Toggle IPv6 support'
-    printf '%s\n' '13) Restart service'
-    printf '%s\n' '14) Show status'
-    printf '%s\n' '15) Show logs'
-    printf '%s\n' '16) Uninstall'
-    printf '%s\n' '0) Exit'
-    printf '%s\n' '========================================'
-    printf 'Select: '
-    read -r choice || return 0
-
-    case "$choice" in
-      1) install_snell; pause_menu ;;
-      2) update_snell; pause_menu ;;
-      3) show_config; pause_menu ;;
-      4)
-        printf 'Server IP or domain: '
-        read -r new_host
-        set_server_host "$new_host"
-        show_config
-        pause_menu
-        ;;
-      5)
-        printf 'New port: '
-        read -r new_port
-        change_port "$new_port"
-        pause_menu
-        ;;
-      6)
-        printf 'New PSK (leave blank for random): '
-        read -r new_psk
-        change_psk "$new_psk"
-        pause_menu
-        ;;
-      7)
-        printf 'Mode [default/unshaped/unsafe-raw]: '
-        read -r new_mode
-        if [ "$new_mode" = "unsafe-raw" ]; then
-          printf 'unsafe-raw disables encryption. Type UNSAFE to continue: '
-          read -r ack
-          if [ "$ack" = "UNSAFE" ]; then
-            ALLOW_UNSAFE_RAW=1 change_mode "$new_mode"
-          else
-            warn "Cancelled."
-          fi
-        else
-          change_mode "$new_mode"
-        fi
-        pause_menu
-        ;;
-      8)
-        printf 'Snell DNS preference [default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only]: '
-        read -r new_dns
-        change_dns "$new_dns"
-        pause_menu
-        ;;
-      9)
-        show_system_dns
-        printf 'Enter DNS IPs separated by spaces, or type restore (blank = cancel): '
-        read -r dns_line
-        case "$(trim_value "$dns_line")" in
-          '') log "Cancelled." ;;
-          restore|RESTORE) restore_system_dns ;;
-          *)
-            set -- $dns_line
-            set_system_dns "$@"
-            ;;
+readShadowTLSConfig(){
+    [ -f "${shadowtls_conf}" ] || return 1
+    stls_port=""; stls_sni=""; stls_password=""; stls_strict="false"
+    local key val
+    while IFS='=' read -r key val; do
+        case "$key" in
+            port) stls_port="$val" ;;
+            sni) stls_sni="$val" ;;
+            password) stls_password="$val" ;;
+            strict) stls_strict="$val" ;;
         esac
-        pause_menu
-        ;;
-      10)
-        if [ "$(current_client_tfo)" = "1" ]; then
-          set_client_tfo off
-        else
-          set_client_tfo on
-        fi
-        if config_exists; then show_config; fi
-        pause_menu
-        ;;
-      11) shadowtls_menu; pause_menu ;;
-      12)
-        if [ "$(current_ipv6_enabled 2>/dev/null || printf 0)" = "1" ]; then
-          toggle_ipv6 off
-        else
-          toggle_ipv6 on
-        fi
-        pause_menu
-        ;;
-      13) service_action restart; if shadowtls_enabled; then start_or_restart_shadowtls || true; fi; pause_menu ;;
-      14) service_action status || true; if shadowtls_enabled; then rc-service "$SHADOWTLS_SERVICE" status || true; fi; pause_menu ;;
-      15) show_logs; if shadowtls_enabled && [ -f "$SHADOWTLS_LOG" ]; then printf '\n--- ShadowTLS log ---\n'; tail -n 100 "$SHADOWTLS_LOG"; fi; pause_menu ;;
-      16) uninstall_snell; pause_menu ;;
-      0) return 0 ;;
-      *) warn "Invalid selection."; pause_menu ;;
+    done < "${shadowtls_conf}"
+    [ -n "$stls_port" ] && [ -n "$stls_sni" ] && [ -n "$stls_password" ]
+}
+
+writeShadowTLSConfig(){
+    mkdir -p "${shadowtls_dir}" || return 1
+    local tmp_conf
+    tmp_conf=$(mktemp "${shadowtls_conf}.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
+    {
+        printf 'port=%s\n' "$stls_port"
+        printf 'sni=%s\n' "$stls_sni"
+        printf 'password=%s\n' "$stls_password"
+        printf 'strict=%s\n' "${stls_strict:-false}"
+    } > "$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
+    mv -f "$tmp_conf" "${shadowtls_conf}" || return 1
+    chmod 600 "${shadowtls_conf}" || return 1
+}
+
+shadowTLSArch(){
+    case "$(uname -m)" in
+        x86_64|amd64) stls_arch="x86_64-unknown-linux-musl" ;;
+        aarch64|armv8*) stls_arch="aarch64-unknown-linux-musl" ;;
+        armv7l|armv7*) stls_arch="armv7-unknown-linux-musleabihf" ;;
+        armv6l|armv6*) stls_arch="arm-unknown-linux-musleabi" ;;
+        *) echo -e "${Error} ShadowTLS 官方 Release 不支持当前架构：$(uname -m)"; return 1 ;;
     esac
-  done
 }
 
-main() {
-  require_root
-  check_platform
-
-  cmd="${1:-menu}"
-  case "$cmd" in
-    menu)
-      [ -t 0 ] || { print_help; exit 1; }
-      interactive_menu
-      ;;
-    install)
-      if [ $# -ge 2 ]; then
-        validate_snell_major "$2" || die "Usage: $0 install [5|6]"
-        SNELL_VERSION="$2"
-        export SNELL_VERSION
-      fi
-      install_snell
-      ;;
-    update)
-      update_snell
-      ;;
-    show|config)
-      show_config
-      ;;
-    port)
-      [ $# -ge 2 ] || die "Usage: $0 port <1-65535>"
-      change_port "$2"
-      ;;
-    psk)
-      change_psk "${2:-}"
-      ;;
-    mode)
-      [ $# -ge 2 ] || die "Usage: $0 mode default|unshaped|unsafe-raw"
-      change_mode "$2"
-      ;;
-    dns)
-      [ $# -ge 2 ] || die "Usage: $0 dns default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only"
-      change_dns "$2"
-      ;;
-    host)
-      [ $# -ge 2 ] || die "Usage: $0 host <server-ip-or-domain>"
-      set_server_host "$2"
-      if config_exists; then show_config; fi
-      ;;
-    local-dns)
-      [ $# -ge 2 ] || die "Usage: $0 local-dns show|set <DNS-IP...>|restore"
-      case "$2" in
-        show) show_system_dns ;;
-        set)
-          [ $# -ge 3 ] || die "Usage: $0 local-dns set <DNS-IP...>"
-          shift 2
-          set_system_dns "$@"
-          ;;
-        restore) restore_system_dns ;;
-        *) die "Usage: $0 local-dns show|set <DNS-IP...>|restore" ;;
-      esac
-      ;;
-    ipv6)
-      [ $# -ge 2 ] || die "Usage: $0 ipv6 on|off"
-      toggle_ipv6 "$2"
-      ;;
-    tfo)
-      [ $# -ge 2 ] || die "Usage: $0 tfo on|off"
-      set_client_tfo "$2"
-      if config_exists; then show_config; fi
-      ;;
-    shadowtls)
-      [ $# -ge 2 ] || die "Usage: $0 shadowtls enable|disable|update|show"
-      case "$2" in
-        enable|configure|reconfigure) enable_shadowtls ;;
-        disable|off) disable_shadowtls ;;
-        update) update_shadowtls ;;
-        show|status) show_shadowtls ;;
-        *) die "Usage: $0 shadowtls enable|disable|update|show" ;;
-      esac
-      ;;
-    start|stop|restart|status)
-      service_action "$cmd"
-      ;;
-    logs)
-      show_logs
-      ;;
-    uninstall)
-      uninstall_snell "${2:-}"
-      ;;
-    help|-h|--help)
-      print_help
-      ;;
-    *)
-      print_help >&2
-      exit 1
-      ;;
-  esac
+installShadowTLSBinary(){
+    shadowTLSArch || return 1
+    local tmp_bin url detected_ver
+    tmp_bin=$(mktemp /tmp/shadow-tls.XXXXXX) || return 1
+    url="https://github.com/ihciah/shadow-tls/releases/latest/download/shadow-tls-${stls_arch}"
+    echo -e "${Info} 下载 ShadowTLS 最新版（${stls_arch}）"
+    if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 --max-time 60 -o "$tmp_bin" "$url"; then
+        rm -f "$tmp_bin"
+        echo -e "${Error} ShadowTLS 下载失败"
+        return 1
+    fi
+    chmod +x "$tmp_bin" || { rm -f "$tmp_bin"; return 1; }
+    "$tmp_bin" --version >/dev/null 2>&1 || { rm -f "$tmp_bin"; echo -e "${Error} ShadowTLS 二进制校验失败"; return 1; }
+    mkdir -p "${shadowtls_dir}" || { rm -f "$tmp_bin"; return 1; }
+    mv -f "$tmp_bin" "${shadowtls_bin}" || return 1
+    chmod +x "${shadowtls_bin}" || return 1
+    detected_ver=$("${shadowtls_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -n "$detected_ver" ] && printf 'v%s\n' "$detected_ver" > "${shadowtls_version_file}"
 }
 
-main "$@"
+shadowSvc(){
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl "$1" shadow-tls >/dev/null 2>&1
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service shadow-tls "$1" >/dev/null 2>&1
+    elif command -v service >/dev/null 2>&1; then
+        service shadow-tls "$1" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+checkShadowTLSStatus(){
+    stls_status="stopped"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active shadow-tls.service >/dev/null 2>&1 && stls_status="running"
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service shadow-tls status >/dev/null 2>&1 && stls_status="running"
+    elif command -v service >/dev/null 2>&1; then
+        service shadow-tls status >/dev/null 2>&1 && stls_status="running"
+    fi
+}
+
+setupShadowTLSService(){
+    shadowTLSConfigured || return 1
+    readShadowTLSConfig || return 1
+    readConfig || return 1
+    local extra="--v3"
+    [ "$stls_strict" = "true" ] && extra="--v3 --strict"
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl show --property=Version >/dev/null 2>&1; then
+        cat > /etc/systemd/system/shadow-tls.service <<EOF_UNIT
+[Unit]
+Description=ShadowTLS for Snell
+After=network.target snell-server.service
+Requires=snell-server.service
+
+[Service]
+Type=simple
+User=root
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=3s
+ExecStart=${shadowtls_bin} server --listen [::]:${stls_port} --server 127.0.0.1:${port} --tls ${stls_sni}:443 --password ${stls_password} ${extra}
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+        systemctl enable shadow-tls >/dev/null 2>&1 || return 1
+    elif [ -d /etc/init.d ] && command -v rc-update >/dev/null 2>&1; then
+        {
+            echo '#!/sbin/openrc-run'
+            echo 'name="shadow-tls"'
+            echo 'description="ShadowTLS for Snell"'
+            printf 'command="%s"\n' "$shadowtls_bin"
+            printf 'command_args="server --listen [::]:%s --server 127.0.0.1:%s --tls %s:443 --password %s %s"\n' "$stls_port" "$port" "$stls_sni" "$stls_password" "$extra"
+            echo 'command_background="yes"'
+            echo 'pidfile="/run/${RC_SVCNAME}.pid"'
+            echo 'output_log="/var/log/shadow-tls.log"'
+            echo 'error_log="/var/log/shadow-tls.log"'
+            echo 'depend() {'
+            echo '    need net snell-server'
+            echo '}'
+        } > /etc/init.d/shadow-tls || return 1
+        chmod +x /etc/init.d/shadow-tls || return 1
+        rc-update add shadow-tls default >/dev/null 2>&1 || return 1
+    else
+        echo -e "${Error} 未找到可用的服务管理器（systemd/OpenRC）"
+        return 1
+    fi
+}
+
+removeShadowTLSArtifacts(){
+    shadowSvc stop >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable shadow-tls >/dev/null 2>&1 || true
+    elif command -v rc-update >/dev/null 2>&1; then
+        rc-update del shadow-tls default >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/shadow-tls.service /etc/init.d/shadow-tls
+    rm -f "${shadowtls_bin}"
+    rm -rf "${shadowtls_dir}"
+    rm -f /run/shadow-tls.pid /var/log/shadow-tls.log
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+setShadowTLSPort(){
+    local old_port="${stls_port:-}"
+    while true; do
+        local prompt="请输入 ShadowTLS 公网端口 [1-65535]（默认 443）："
+        [ -n "$old_port" ] && prompt="请输入 ShadowTLS 公网端口 [1-65535]（当前 ${old_port}，回车保留）："
+        readInput "$prompt"
+        input_stls_port="$REPLY"
+        [ -z "$input_stls_port" ] && input_stls_port="${old_port:-443}"
+        if ! echo "$input_stls_port" | grep -qE '^[0-9]+$' || [ "$input_stls_port" -lt 1 ] || [ "$input_stls_port" -gt 65535 ]; then
+            echo -e "${Error} 端口无效"
+            continue
+        fi
+        [ "$input_stls_port" = "$port" ] && { echo -e "${Error} 不能与 Snell 内部端口 ${port} 相同"; continue; }
+        if [ "$input_stls_port" != "$old_port" ] && ss -tln | grep -q ":$input_stls_port "; then
+            echo -e "${Error} 端口 $input_stls_port 已被占用"
+            continue
+        fi
+        stls_port="$input_stls_port"
+        break
+    done
+}
+
+setShadowTLSSNI(){
+    local prompt="请输入 ShadowTLS 握手域名（默认 www.apple.com）："
+    [ -n "${stls_sni:-}" ] && prompt="请输入 ShadowTLS 握手域名（当前 ${stls_sni}，回车保留）："
+    while true; do
+        readInput "$prompt"
+        input_stls_sni="$REPLY"
+        [ -z "$input_stls_sni" ] && input_stls_sni="${stls_sni:-www.apple.com}"
+        case "$input_stls_sni" in
+            *[!A-Za-z0-9.-]*|.*|*.) echo -e "${Error} 域名格式无效" ;;
+            *) stls_sni="$input_stls_sni"; break ;;
+        esac
+    done
+}
+
+setShadowTLSPassword(){
+    local prompt="请输入 ShadowTLS 密码（16-64 位，回车随机生成）："
+    [ -n "${stls_password:-}" ] && prompt="请输入 ShadowTLS 密码（已设置，回车保留）："
+    while true; do
+        readInput "$prompt"
+        input_stls_password="$REPLY"
+        if [ -z "$input_stls_password" ] && [ -n "${stls_password:-}" ]; then break; fi
+        if [ -z "$input_stls_password" ]; then
+            stls_password=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 24)
+            break
+        fi
+        if [ ${#input_stls_password} -lt 16 ] || [ ${#input_stls_password} -gt 64 ]; then
+            echo -e "${Error} 密码长度必须为 16-64 位"; continue
+        fi
+        case "$input_stls_password" in
+            *[!A-Za-z0-9._~-]*) echo -e "${Error} 仅支持 A-Z a-z 0-9 . _ ~ -" ;;
+            *) stls_password="$input_stls_password"; break ;;
+        esac
+    done
+}
+
+setShadowTLSStrict(){
+    echo "ShadowTLS v3 严格模式：1) 关闭（推荐）  2) 开启（仅 TLS 1.3）"
+    local current="1"
+    [ "${stls_strict:-false}" = "true" ] && current="2"
+    while true; do
+        readInput "选择 [1/2]（当前 ${current}，回车保留）："
+        input_stls_strict="$REPLY"
+        [ -z "$input_stls_strict" ] && input_stls_strict="$current"
+        case "$input_stls_strict" in
+            1) stls_strict="false"; break ;;
+            2) stls_strict="true"; break ;;
+            *) echo -e "${Error} 输入无效" ;;
+        esac
+    done
+}
+
+configureShadowTLSValues(){
+    setShadowTLSPort
+    setShadowTLSSNI
+    setShadowTLSPassword
+    setShadowTLSStrict
+}
+
+installShadowTLS(){
+    checkInstalledStatus || return 1
+    readConfig || return 1
+    shadowTLSConfigured && { echo -e "${Tip} ShadowTLS 已安装"; sleep 2; return 0; }
+    stls_port=""; stls_sni=""; stls_password=""; stls_strict="false"
+    simpleHeader
+    echo
+    echo "安装 ShadowTLS v3"
+    echo -e "${Tip} 启用后 Snell 仅监听 127.0.0.1:${port}"
+    configureShadowTLSValues
+    readInput "确认安装？(Y/n，默认 y)："
+    confirm="$REPLY"; [ -z "$confirm" ] && confirm="y"
+    [ "$confirm" = "n" ] || [ "$confirm" = "N" ] && return 0
+
+    local old_listen="$listen_val" was_running=false
+    checkStatus; [ "$status" = "running" ] && was_running=true
+    installShadowTLSBinary || return 1
+    writeShadowTLSConfig || { removeShadowTLSArtifacts; return 1; }
+    listen_val="127.0.0.1:${port}"
+    if ! writeConfig || ! setupShadowTLSService; then
+        echo -e "${Error} 配置失败，正在回滚"
+        removeShadowTLSArtifacts
+        listen_val="$old_listen"; writeConfig >/dev/null 2>&1 || true
+        return 1
+    fi
+    if [ "$was_running" = true ]; then
+        svc restart >/dev/null 2>&1 || return 1
+        waitServiceStart
+        [ "$status" = "running" ] && shadowSvc start >/dev/null 2>&1 || true
+    fi
+    echo -e "${Info} ShadowTLS 安装完成"
+    [ "$was_running" != true ] && echo -e "${Tip} Snell 原本为停止状态，ShadowTLS 保持停止"
+    sleep 2
+}
+
+modifyShadowTLS(){
+    shadowTLSConfigured || { echo -e "${Error} ShadowTLS 尚未安装"; sleep 2; return 1; }
+    readConfig || return 1
+    readShadowTLSConfig || return 1
+    simpleHeader; echo; echo "修改 ShadowTLS 配置"
+    configureShadowTLSValues
+    writeShadowTLSConfig || return 1
+    listen_val="127.0.0.1:${port}"; writeConfig || return 1
+    setupShadowTLSService || return 1
+    checkStatus
+    if [ "$status" = "running" ]; then
+        svc restart >/dev/null 2>&1 || true; waitServiceStart
+        [ "$status" = "running" ] && shadowSvc restart >/dev/null 2>&1 || true
+    fi
+    echo -e "${Info} ShadowTLS 配置已更新"; sleep 2
+}
+
+updateShadowTLS(){
+    shadowTLSConfigured || { echo -e "${Error} ShadowTLS 尚未安装"; sleep 2; return 1; }
+    local old_ver new_ver was_running=false
+    old_ver=$("${shadowtls_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    checkShadowTLSStatus; [ "$stls_status" = "running" ] && was_running=true
+    installShadowTLSBinary || return 1
+    new_ver=$("${shadowtls_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ "$was_running" = true ] && shadowSvc restart >/dev/null 2>&1 || true
+    [ "$old_ver" = "$new_ver" ] && echo -e "${Info} 已是最新版本：v${new_ver}" || echo -e "${Info} 已更新：v${old_ver:-?} → v${new_ver:-?}"
+    sleep 2
+}
+
+uninstallShadowTLS(){
+    shadowTLSConfigured || { echo -e "${Tip} ShadowTLS 尚未安装"; sleep 2; return 0; }
+    readInput "确认卸载 ShadowTLS 并恢复 Snell 公网直连？(y/N)："
+    confirm="$REPLY"; [ "$confirm" = "y" ] || [ "$confirm" = "Y" ] || return 0
+    readConfig || return 1
+    local was_running=false
+    checkStatus; [ "$status" = "running" ] && was_running=true
+    removeShadowTLSArtifacts
+    listen_val="::0:${port}"; writeConfig || return 1
+    if [ "$was_running" = true ]; then svc restart >/dev/null 2>&1 || true; waitServiceStart; fi
+    echo -e "${Info} ShadowTLS 已卸载，Snell 已恢复直接监听"; sleep 2
+}
+
+viewShadowTLSStatus(){
+    shadowTLSConfigured || { echo -e "${Error} ShadowTLS 尚未安装"; sleep 2; return 1; }
+    readConfig || return 1; readShadowTLSConfig || return 1; checkShadowTLSStatus
+    local full_ver
+    full_ver=$("${shadowtls_bin}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    simpleHeader; echo
+    echo "ShadowTLS"
+    echo "版本      : v${full_ver:-?} / 协议 v3"
+    echo "服务状态  : ${stls_status}"
+    echo "公网端口  : ${stls_port}"
+    echo "Snell 后端: 127.0.0.1:${port}"
+    echo "握手 SNI  : ${stls_sni}"
+    echo "严格模式  : ${stls_strict}"
+    pauseMenu
+}
+
+shadowTLSMenu(){
+    while true; do
+        simpleHeader; echo; echo "ShadowTLS 管理"
+        if shadowTLSConfigured; then
+            echo " 1) 修改配置    2) 查看状态"
+            echo " 3) 更新程序    4) 卸载 ShadowTLS"
+        else
+            echo " 1) 安装 ShadowTLS v3"
+        fi
+        echo " 0) 返回主菜单"; echo
+        readInput ""; stls_choice="$REPLY"
+        case "$stls_choice" in
+            0|'') return 0 ;;
+            1) if shadowTLSConfigured; then modifyShadowTLS; else installShadowTLS; fi ;;
+            2) viewShadowTLSStatus ;;
+            3) updateShadowTLS ;;
+            4) uninstallShadowTLS ;;
+            *) echo -e "${Error} 输入无效"; sleep 2 ;;
+        esac
+    done
+}
+
+# 针对 Snell v6 检查密钥长度
+checkPskForV6(){
+    if [ ${#psk} -lt 16 ] || [ ${#psk} -gt 255 ]; then
+        echo -e "${Error} 当前密钥长度为 ${#psk}，不符合 Snell v6 要求（16-255 位）"
+        echo -e "请选择处理方式："
+        echo -e "   1. 自动生成安全的随机长密钥（推荐）"
+        echo -e "   2. 手动输入新的长密钥"
+        while true; do
+            readInput " 请选择 [1/2]（默认 1）: "
+            psk_choice="$REPLY"
+            [ -z "${psk_choice}" ] && psk_choice="1"
+            case "$psk_choice" in
+                1) psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)
+                   echo -e "${Info} 已自动生成新密钥: ${Green_font_prefix}${psk}${Font_color_suffix}"
+                   break ;;
+                2)
+                   while true; do
+                       readInput " 请输入新的密钥 [16-255 位]: "
+                       new_psk="$REPLY"
+                       if [ ${#new_psk} -ge 16 ] && [ ${#new_psk} -le 255 ]; then
+                           psk=$new_psk
+                           break
+                       else
+                           echo -e "${Error} 密钥长度必须在 16 到 255 位之间！"
+                       fi
+                   done
+                   break ;;
+                *) echo -e "${Error} 输入无效，仅支持 1 或 2" ;;
+            esac
+        done
+    fi
+}
+
+# 设置项回显框
+showSettingResult(){
+    echo
+    echo "$1"
+    echo
+}
+
+# 写入配置文件
+writeConfig(){
+    mkdir -p "${snell_dir}" || {
+        echo -e "${Error} 无法创建 Snell 配置目录"
+        return 1
+    }
+    local tmp_conf
+    tmp_conf=$(mktemp "${snell_conf}.tmp.XXXXXX") || {
+        echo -e "${Error} 无法创建临时配置文件"
+        return 1
+    }
+    chmod 600 "${tmp_conf}" || {
+        rm -f "${tmp_conf}"
+        echo -e "${Error} 无法保护临时配置文件"
+        return 1
+    }
+
+    # 生成主配置（使用 printf 原样写入，避免转义用户输入）
+    if ! {
+        printf '%s\n' "[snell-server]"
+        printf '%s\n' "listen = ${listen_val}"
+        if [ "${ver}" != "6" ]; then
+            printf '%s\n' "ipv6 = ${ipv6}"
+        else
+            printf '%s\n' "# ipv6 = ${ipv6}"
+        fi
+        printf '%s\n' "psk = ${psk}"
+        if [ "${ver}" != "6" ]; then
+            printf '%s\n' "obfs = ${obfs}"
+        else
+            printf '%s\n' "# obfs = ${obfs}"
+        fi
+        if [ "${ver}" != "6" ] && [ "${obfs}" != "off" ]; then
+            printf '%s\n' "obfs-host = ${host}"
+        elif [ "${ver}" = "6" ] && [ "${obfs}" != "off" ]; then
+            printf '%s\n' "# obfs-host = ${host}"
+        fi
+        printf '%s\n' "tfo = ${tfo}"
+        if [ "${ver}" = "6" ]; then
+            printf '%s\n' "dns-ip-preference = ${dns_ip_pref:-default}"
+            printf '%s\n' "mode = ${mode:-default}"
+        else
+            [ -n "${dns_ip_pref}" ] && printf '%s\n' "# dns-ip-preference = ${dns_ip_pref}"
+            [ -n "${mode}" ] && printf '%s\n' "# mode = ${mode}"
+        fi
+        [ -n "${egress_interface}" ] && printf '%s\n' "egress-interface = ${egress_interface}"
+        printf '%s\n' "version = ${ver}"
+    } > "${tmp_conf}"; then
+        rm -f "${tmp_conf}"
+        echo -e "${Error} 无法生成 Snell 配置"
+        return 1
+    fi
+
+    # 保留未知的自定义配置项
+    if [ -f "${snell_conf}" ]; then
+        local custom_configs=$(awk -F '=' '{
+            key = $1
+            sub(/^[[:space:]]+/, "", key)
+            sub(/[[:space:]]+$/, "", key)
+            if (key != "listen" && key != "ipv6" && key != "psk" && key != "obfs" && key != "obfs-host" && key != "tfo" && key != "dns-ip-preference" && key != "mode" && key != "version" && key != "egress-interface" && key != "[snell-server]" && $0 !~ /^[[:space:]]*#/) {
+                if (NF > 0 && $0 !~ /^[[:space:]]*$/) {
+                    print $0
+                }
+            }
+        }' "${snell_conf}")
+
+        if [ -n "${custom_configs}" ]; then
+            printf '\n' >> "${tmp_conf}"
+            printf '%s\n' "# Custom Configs" >> "${tmp_conf}"
+            printf '%s\n' "${custom_configs}" >> "${tmp_conf}"
+        fi
+    fi
+
+    if ! mv -f "${tmp_conf}" "${snell_conf}"; then
+        rm -f "${tmp_conf}"
+        echo -e "${Error} 无法替换 Snell 配置文件"
+        return 1
+    fi
+    if ! chmod 600 "${snell_conf}"; then
+        echo -e "${Error} 无法设置配置文件权限"
+        return 1
+    fi
+    return 0
+}
+
+# 读取配置文件（单次 awk 解析全部字段，替代逐行 cat|grep|awk）
+readConfig(){
+	[ ! -e "${snell_conf}" ] && echo -e "${Error} Snell Server 配置文件不存在！" && return 1
+	# 每次读取前重置字段，避免旧配置值污染当前配置
+	listen_val=""
+	port=""
+	ipv6="false"
+	psk=""
+	obfs="off"
+	host=""
+	tfo="true"
+	dns_ip_pref=""
+	mode=""
+	egress_interface=""
+	local conf_tmp
+	conf_tmp=$(mktemp /tmp/snell_config_parse.XXXXXX) || {
+		echo -e "${Error} 无法创建配置解析临时文件"
+		return 1
+	}
+	chmod 600 "$conf_tmp" || {
+		rm -f "$conf_tmp"
+		echo -e "${Error} 无法保护配置解析临时文件"
+		return 1
+	}
+	# 只解析 [snell-server] 区块，跳过注释和其他区块
+	if ! awk -F '=' '
+		/^[[:space:]]*#/ { next }
+		/^[[:space:]]*\[/ {
+			in_snell = ($0 ~ /^[[:space:]]*\[snell-server\][[:space:]]*$/)
+			next
+		}
+		!in_snell || NF < 2 { next }
+		{
+			key=$1
+			value=$0
+			sub(/^[^=]*=/, "", value)
+			sub(/^[[:space:]]+/, "", key)
+			sub(/[[:space:]]+$/, "", key)
+			sub(/^[[:space:]]*/, "", value)
+			sub(/[[:space:]]*$/, "", value)
+			print key "=" value
+		}
+	' "${snell_conf}" > "$conf_tmp"; then
+		rm -f "$conf_tmp"
+		echo -e "${Error} 无法解析 Snell 配置文件"
+		return 1
+	fi
+
+	local key val
+	while IFS='=' read -r key val; do
+		case "$key" in
+			listen)
+				listen_val="$val"
+				port=$(printf '%s' "$val" | awk -F',' '{print $1}' | sed 's/.*://')
+				;;
+			ipv6) ipv6="$val" ;;
+			psk) psk="$val" ;;
+			obfs) obfs="$val" ;;
+			obfs-host) host="$val" ;;
+			tfo) tfo="$val" ;;
+			version) ver="$val" ;;
+			dns-ip-preference) dns_ip_pref="$val" ;;
+			mode) mode="$val" ;;
+			egress-interface) egress_interface="$val" ;;
+		esac
+	done < "$conf_tmp"
+	rm -f "$conf_tmp"
+
+	[ -z "$dns_ip_pref" ] && [ "$ver" = "6" ] && dns_ip_pref="default"
+	[ -z "$mode" ] && [ "$ver" = "6" ] && mode="default"
+	return 0
+}
+
+# 设置端口
+setPort(){
+    local orig_port="$port"
+    echo -e "${Tip} 请手动放行防火墙端口（脚本不操作系统防火墙）"
+    while true; do
+        local p_prompt="请输入端口 [1-65535]（默认 8443）："
+        [ -n "$port" ] && p_prompt="请输入端口 [1-65535]（当前 ${port}，回车保留）："
+        readInput "$p_prompt"
+        input_port="$REPLY"
+        [ -z "${input_port}" ] && input_port="${port:-8443}"
+        if ! echo "$input_port" | grep -qE '^[0-9]+$' || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+            echo -e "${Error} 端口无效，请输入 1-65535 之间的数字"
+
+            continue
+        fi
+        port=$input_port
+        if shadowTLSConfigured; then
+            readShadowTLSConfig >/dev/null 2>&1 || true
+            if [ -n "${stls_port:-}" ] && [ "$port" = "$stls_port" ]; then
+                echo -e "${Error} Snell 内部端口不能与 ShadowTLS 公网端口 ${stls_port} 相同"
+                port="$orig_port"
+                continue
+            fi
+            listen_val="127.0.0.1:${port}"
+        else
+            # v5/v6 均使用 ::0:port 双栈简写（实测 v6 兼容该格式）
+            listen_val="::0:${port}"
+        fi
+        if [ "$port" != "$orig_port" ] && ss -tuln | grep -q ":$port "; then
+            echo -e "${Error} 端口 $port 已被占用，请选择其他端口"
+        else
+            showSettingResult "端口 : ${Red_background_prefix} ${port} ${Font_color_suffix}"
+            break
+        fi
+    done
+}
+
+# 设置 IPv6
+setIpv6(){
+	echo
+	echo "IPv6 解析"
+	echo " 1) 开启"
+	echo " 2) 关闭"
+	local current_opt="2"
+	[ "$ipv6" = "true" ] && current_opt="1"
+	local p_prompt="选择 [1/2]（默认 2.关闭）："
+	[ -n "$ipv6" ] && p_prompt="选择 [1/2]（当前 ${current_opt}，回车保留）："
+	while true; do
+		readInput "$p_prompt"
+		input_ipv6="$REPLY"
+		[ -z "${input_ipv6}" ] && input_ipv6="$current_opt"
+		case "$input_ipv6" in
+			1) ipv6=true; break ;;
+			2) ipv6=false; break ;;
+			*) echo -e "${Error} 输入无效，仅支持 1 或 2" ;;
+		esac
+	done
+	showSettingResult "IPv6 解析 开启状态：${Red_background_prefix} ${ipv6} ${Font_color_suffix}"
+}
+
+# 设置密钥
+setPSK(){
+	echo "密钥设置（回车生成随机密钥；已有密钥回车保留）"
+	local p_prompt="请输入密钥（回车随机生成）："
+	[ -n "$psk" ] && p_prompt="请输入密钥（已有密钥，回车保留）："
+
+	if [ "$ver" = "6" ]; then
+	    echo -e "${Tip} Snell v6 密钥长度要求：16-255 位"
+	    while true; do
+	        readInput "$p_prompt"
+	        input_psk="$REPLY"
+	        if [ -z "${input_psk}" ] && [ -n "$psk" ]; then
+	            break
+	        elif [ -z "${input_psk}" ]; then
+	            psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 20)
+	            break
+	        elif [ ${#input_psk} -ge 16 ] && [ ${#input_psk} -le 255 ]; then
+	            psk=$input_psk
+	            break
+	        else
+	            echo -e "${Error} 密钥长度必须在 16 到 255 位之间"
+	        fi
+	    done
+	else
+	    readInput "$p_prompt"
+	    input_psk="$REPLY"
+	    if [ -z "${input_psk}" ] && [ -z "$psk" ]; then
+	        psk=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 16)
+	    elif [ -n "${input_psk}" ]; then
+	        psk=$input_psk
+	    fi
+	fi
+
+	showSettingResult "密钥已设置"
+}
+
+# 设置 OBFS
+setObfs(){
+    echo
+    echo "OBFS 设置"
+    echo " 1) TLS"
+    echo " 2) HTTP"
+    echo " 3) 关闭"
+    local current_opt="3"
+    if [ "$obfs" = "tls" ]; then current_opt="1"; elif [ "$obfs" = "http" ]; then current_opt="2"; fi
+    local p_prompt="选择 [1-3]（默认 3.关闭）："
+    [ -n "$obfs" ] && p_prompt="选择 [1-3]（当前 ${current_opt}，回车保留）："
+    while true; do
+        readInput "$p_prompt"
+        input_obfs="$REPLY"
+        [ -z "${input_obfs}" ] && input_obfs="$current_opt"
+        case "$input_obfs" in
+            1|2|3) break ;;
+            *) echo -e "${Error} 输入无效，仅支持 1、2 或 3" ;;
+        esac
+    done
+    if [ "${input_obfs}" = "1" ]; then
+        obfs="tls"
+        setHost  # 强制设置 OBFS 域名
+    elif [ "${input_obfs}" = "2" ]; then
+        obfs="http"
+        setHost  # 强制设置 OBFS 域名
+    else
+        obfs="off"
+        host=""  # 清空 host
+    fi
+    local obfs_info="OBFS 状态：${Red_background_prefix} ${obfs} ${Font_color_suffix}"
+    if [ "${obfs}" != "off" ]; then
+        obfs_info="${obfs_info}\nOBFS 域名：${Red_background_prefix} ${host} ${Font_color_suffix}"
+    fi
+    showSettingResult "$obfs_info"
+}
+
+# 设置协议版本
+setVer(){
+	echo
+	echo "协议版本"
+	echo " 1) v5"
+	echo " 2) v6"
+	local current_opt="1"
+	[ "$ver" = "6" ] && current_opt="2"
+	local p_prompt="选择 [1/2]（默认 1.v5）："
+	[ -n "$ver" ] && p_prompt="选择 [1/2]（当前 ${current_opt}，回车保留）："
+	readInput "$p_prompt"
+	input_ver="$REPLY"
+	[ -z "${input_ver}" ] && input_ver="$current_opt"
+	case "$input_ver" in
+		1) ver="5" ;;
+		2) ver="6" ;;
+		*)
+			echo -e "${Error} 输入无效，仅支持 1 或 2"
+			return 1
+			;;
+	esac
+	showSettingResult "Snell Server 协议版本：${Red_background_prefix} v${ver} ${Font_color_suffix}"
+}
+
+# 设置 OBFS 域名
+setHost(){
+	echo "请输入 Snell Server 域名，Snell v5 版本及以上如无特别需求可忽略。"
+	local p_prompt="请输入域名（默认 www.wechat.com）："
+	[ -n "$host" ] && p_prompt="请输入域名（当前 ${host}，回车保留）："
+	while true; do
+		readInput "$p_prompt"
+		input_host="$REPLY"
+		if [ -z "${input_host}" ]; then
+			host="${host:-www.wechat.com}"
+			break
+		fi
+		case "$input_host" in
+			*[!A-Za-z0-9.-]*) echo -e "${Error} 域名格式无效，请勿包含空格或特殊字符" ;;
+			*) host="$input_host"; break ;;
+		esac
+	done
+	showSettingResult "域名 : ${Red_background_prefix} ${host} ${Font_color_suffix}"
+}
+
+# 设置 TCP Fast Open
+setTFO(){
+	echo
+	echo "TCP Fast Open"
+	echo " 1) 开启"
+	echo " 2) 关闭"
+	local current_opt="1"
+	[ "$tfo" = "false" ] && current_opt="2"
+	local p_prompt="选择 [1/2]（默认 1.开启）："
+	[ -n "$tfo" ] && p_prompt="选择 [1/2]（当前 ${current_opt}，回车保留）："
+	while true; do
+		readInput "$p_prompt"
+		input_tfo="$REPLY"
+		[ -z "${input_tfo}" ] && input_tfo="$current_opt"
+		case "$input_tfo" in
+			1) tfo=true; break ;;
+			2) tfo=false; break ;;
+			*) echo -e "${Error} 输入无效，仅支持 1 或 2" ;;
+		esac
+	done
+	showSettingResult "Snell TFO 开启状态：${Red_background_prefix} ${tfo} ${Font_color_suffix}"
+}
+
+# 设置 DNS IP 偏好 (Snell v6 专属)
+setDNSIPPref(){
+	echo
+	echo "DNS IP 偏好"
+	echo " 1) default"
+	echo " 2) prefer-ipv4"
+	echo " 3) prefer-ipv6"
+	echo " 4) ipv4-only"
+	echo " 5) ipv6-only"
+	local current_opt="1"
+	if [ "$dns_ip_pref" = "prefer-ipv4" ]; then current_opt="2"; elif [ "$dns_ip_pref" = "prefer-ipv6" ]; then current_opt="3"; elif [ "$dns_ip_pref" = "ipv4-only" ]; then current_opt="4"; elif [ "$dns_ip_pref" = "ipv6-only" ]; then current_opt="5"; fi
+	local p_prompt="选择 [1-5]（默认 1.default）："
+	[ -n "$dns_ip_pref" ] && p_prompt="选择 [1-5]（当前 ${current_opt}，回车保留）："
+	while true; do
+		readInput "$p_prompt"
+		input_pref="$REPLY"
+		[ -z "${input_pref}" ] && input_pref="$current_opt"
+		case "$input_pref" in
+			1) dns_ip_pref="default"; break ;;
+			2) dns_ip_pref="prefer-ipv4"; break ;;
+			3) dns_ip_pref="prefer-ipv6"; break ;;
+			4) dns_ip_pref="ipv4-only"; break ;;
+			5) dns_ip_pref="ipv6-only"; break ;;
+			*) echo -e "${Error} 输入无效，仅支持 1 到 5" ;;
+		esac
+	done
+	showSettingResult "DNS IP 偏好 状态：${Red_background_prefix} ${dns_ip_pref} ${Font_color_suffix}"
+}
+
+# 设置 模式 (Snell v6 专属)
+setMode(){
+	echo
+	echo "混淆模式"
+	echo " 1) default"
+	echo " 2) unshaped"
+	echo " 3) unsafe-raw"
+	local current_opt="1"
+	if [ "$mode" = "unshaped" ]; then current_opt="2"; elif [ "$mode" = "unsafe-raw" ]; then current_opt="3"; fi
+	local p_prompt="选择 [1-3]（默认 1.default）："
+	[ -n "$mode" ] && p_prompt="选择 [1-3]（当前 ${current_opt}，回车保留）："
+	while true; do
+		readInput "$p_prompt"
+		input_pref="$REPLY"
+		[ -z "${input_pref}" ] && input_pref="$current_opt"
+		case "$input_pref" in
+			1) mode="default"; break ;;
+			2) mode="unshaped"; break ;;
+			3) mode="unsafe-raw"; break ;;
+			*) echo -e "${Error} 输入无效，仅支持 1、2 或 3" ;;
+		esac
+	done
+	showSettingResult "混淆模式：${Red_background_prefix} ${mode} ${Font_color_suffix}"
+}
+
+# 选择目标版本（网页版优先并验证，否则用脚本内置版本）
+pickVersion(){
+    local new_ver=$1
+    local script_version=""
+    case "$new_ver" in
+        "5") script_version=${snell_v5_version} ;;
+        "6") script_version=${snell_v6_version} ;;
+    esac
+
+    local web_version=$(getLatestVersionFromWeb "v${new_ver}")
+    if [ -n "$web_version" ] && validateVersionUrl "$web_version"; then
+        # 网页版本比脚本内置版本旧时，回退脚本内置版本（避免装到历史版本）
+        if [ -n "$script_version" ]; then
+            compareVersions "$web_version" "$script_version"
+            if [ $? -eq 2 ]; then
+                echo "$script_version"
+                return 0
+            fi
+        fi
+        echo "$web_version"
+        return 0
+    fi
+    [ -n "$script_version" ] && echo "$script_version"
+    return 0
+}
+
+# 等待服务启动（最多 10 秒），结束后 $status 为 running/stopped
+waitServiceStart(){
+	local i=0
+	while [ "$i" -lt 10 ]; do
+		sleep 1
+		checkStatus
+		[ "$status" = "running" ] && break
+		i=$((i+1))
+	done
+}
+
+# 切换二进制版本（下载失败时原二进制未被替换，直接恢复服务）
+switchBinary(){
+    local old_version="$1"
+    local new_version="$2"
+    local target_full_version
+    echo -e "${Info} 开始切换 Snell v${old_version} → v${new_version}"
+
+    local was_running=false
+    checkStatus
+    [ "$status" = "running" ] && was_running=true
+    if [ "$was_running" = true ] && ! svc stop; then
+        echo -e "${Error} 无法停止当前 Snell Server，取消切换"
+        return 1
+    fi
+    target_full_version=$(pickVersion "$new_version")
+
+    if [ -n "$target_full_version" ] && downloadSnell "${target_full_version}" "Snell v${new_version} 版本"; then
+        return 0
+    fi
+
+    echo -e "${Error} Snell v${new_version} 下载失败，保持当前版本"
+    return 1
+}
+
+# 应用单项配置修改（读取配置 → 调用设置函数 → 写入 → 重启）
+applyConfigChange(){
+	local setter=$1
+	simpleHeader
+	if ! "$setter"; then
+		echo -e "${Error} 配置项设置失败"
+		sleep 2
+		startMenu
+		return 1
+	fi
+	if ! writeConfig; then
+		sleep 2
+		startMenu
+		return 1
+	fi
+	restartSnell
+}
+
+# 修改配置
+setConfig(){
+    checkInstalledStatus || return 1
+    local cver
+    while true; do
+        readConfig || break
+        cver="$ver"
+        simpleHeader
+        echo
+        echo "设置配置（当前 Snell v${cver}）"
+        echo " 1) 设置监听端口"
+        echo " 2) 设置密钥"
+        if [ "$cver" != "6" ]; then
+            echo " 3) 设置 OBFS"
+            echo " 4) 设置 OBFS 域名"
+            echo " 5) 设置 IPv6 解析"
+        fi
+        echo " 6) 设置 TCP Fast Open"
+        echo " 7) 切换协议版本"
+        if [ "$cver" = "6" ]; then
+            echo " 8) 设置 DNS IP 偏好"
+            echo " 9) 设置混淆模式"
+        fi
+        echo "10) 设置全部配置"
+        echo
+        readInput "按回车返回主菜单: "
+        modify="$REPLY"
+        [ -z "${modify}" ] && break
+
+        case "$modify" in
+            1) applyConfigChange setPort ;;
+            2) applyConfigChange setPSK ;;
+            3) applyConfigChange setObfs ;;  # setObfs 内已处理 host
+            4)
+                if [ "${obfs}" = "off" ]; then
+                    echo -e "${Error} OBFS 当前为 off，无法设置 OBFS 域名。"
+                    sleep 2
+                    continue
+                fi
+                applyConfigChange setHost
+                ;;
+            5) applyConfigChange setIpv6 ;;
+            6) applyConfigChange setTFO ;;
+            7)
+                if ! confirmVersionSwitch "$cver"; then
+                    sleep 2
+                    continue
+                fi
+                if [ "$ver" != "$cver" ]; then
+                    applyVersionSwitch "$cver"
+                else
+                    if ! writeConfig; then
+                        sleep 2
+                        continue
+                    fi
+                    restartSnell
+                fi
+                ;;
+            8)
+                [ "$cver" != "6" ] && echo -e "${Error} 当前版本不是 Snell v6，不支持 DNS IP 偏好配置！" && sleep 2 && continue
+                applyConfigChange setDNSIPPref
+                ;;
+            9)
+                [ "$cver" != "6" ] && echo -e "${Error} 当前版本不是 Snell v6，不支持混淆模式配置！" && sleep 2 && continue
+                applyConfigChange setMode
+                ;;
+            10)
+                confirmVersionSwitch "$cver"
+
+                setPort; setPSK
+                [ "$ver" != "6" ] && setIpv6
+                setTFO
+
+                if [ "$ver" != "$cver" ]; then
+                    # 版本专属配置由 applyVersionSwitch 统一询问，避免重复
+                    applyVersionSwitch "$cver"
+                else
+                    if [ "$ver" = "6" ]; then
+                        setDNSIPPref; setMode; checkPskForV6
+                    else
+                        setObfs
+                    fi
+                    if ! writeConfig; then
+                        sleep 2
+                        continue
+                    fi
+                    restartSnell
+                fi
+                ;;
+            *)
+                echo -e "${Error} 请输入正确数字${Yellow_font_prefix}[1-10]${Font_color_suffix}"
+                sleep 2
+                continue
+                ;;
+        esac
+    done
+    return 0
+}
+
+# 选择协议版本并确认切换（取消时恢复原版本，返回 1）
+confirmVersionSwitch(){
+    local current=$1
+    setVer || { ver=$current; return 1; }
+    [ "$ver" = "$current" ] && return 0
+    if [ "$ver" -gt "$current" ]; then
+        echo -e "${Info} 协议版本将从 Snell v${current} 升级到 Snell v${ver}"
+        echo -e "确定要升级吗？(y/N)"
+    else
+        echo -e "${Info} 协议版本将从 Snell v${current} 降级到 Snell v${ver}"
+        echo -e "确定要降级吗？(y/N)"
+    fi
+    readInput " 确认切换？（默认 n）: "
+    confirm="$REPLY"
+    [ -z "${confirm}" ] && confirm="n"
+    if [ "$confirm" != Y ] && [ "$confirm" != y ]; then
+        echo -e "${Info} 已取消切换，保持原版本"
+        ver=$current
+        return 1
+    fi
+    return 0
+}
+
+# 切换二进制版本并应用（成功/失败均进入主菜单）
+applyVersionSwitch(){
+    local current=$1
+    local was_running=false
+    checkStatus
+    [ "$status" = "running" ] && was_running=true
+
+    if [ "$ver" = "6" ]; then
+        setDNSIPPref; setMode; checkPskForV6
+    else
+        setObfs
+    fi
+
+    if ! switchBinary "$current" "$ver"; then
+        ver=$current
+        if ! writeConfig; then
+            echo -e "${Error} 无法恢复原版本配置"
+            sleep 2
+            startMenu
+            return 1
+        fi
+        if [ "$was_running" = true ]; then
+            restartSnell
+        else
+            echo -e "${Info} 已取消切换，服务保持停止状态"
+        fi
+        return
+    fi
+
+    if ! writeConfig; then
+        echo -e "${Error} 新版本配置写入失败"
+        sleep 2
+        startMenu
+        return 1
+    fi
+
+    if [ "$was_running" = true ]; then
+        if ! svc restart; then
+            status="stopped"
+        else
+            waitServiceStart
+        fi
+        if [ "$status" != "running" ]; then
+            echo -e "${Error} 协议切换后服务启动失败，以下为错误日志："
+            command -v journalctl >/dev/null 2>&1 && journalctl -u snell-server -n 20 --no-pager || rc-service snell-server status
+        else
+            echo -e "${Info} Snell Server 重启完毕！"
+        fi
+    else
+        echo -e "${Info} 版本切换完成，服务保持停止状态"
+    fi
+    sleep 2
+    startMenu
+}
+# 清理失败的安装残留
+cleanupFailedInstall(){
+    rm -f "${snell_bin}" /etc/systemd/system/snell-server.service /etc/init.d/snell-server
+    rm -rf "${snell_dir}"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1
+}
+
+# 安装 Snell 核心流程（按版本参数化配置项与下载源）
+installSnellCore(){
+	local v=$1
+	local target_ver=""
+	installDependencies || return 1
+	setPort
+	setPSK
+	if [ "$v" = "6" ]; then
+		setTFO
+		setDNSIPPref
+		setMode
+	else
+		setObfs
+		setIpv6
+		setTFO
+	fi
+	if [ "$v" = "6" ]; then
+		target_ver=${snell_v6_version}
+	else
+		target_ver=${snell_v5_version}
+	fi
+	if ! downloadSnell "${target_ver}" "Snell v${v} 官网源版"; then
+		cleanupFailedInstall
+		sleep 2
+		startMenu
+		return 1
+	fi
+	if ! setupService || ! writeConfig; then
+		echo -e "${Error} Snell Server 安装配置失败"
+		cleanupFailedInstall
+		sleep 2
+		startMenu
+		return 1
+	fi
+	startSnell || {
+		startMenu
+		return 1
+	}
+    viewConfig
+}
+
+# 启动 Snell
+startSnell(){
+    checkInstalledStatus || return 1
+    checkStatus
+    if [ "$status" = "running" ]; then
+        return 0
+    fi
+    if ! svc start; then
+        echo -e "${Error} Snell Server 启动命令失败"
+        sleep 2
+        return 1
+    fi
+    waitServiceStart
+
+    if [ "$status" != "running" ]; then
+        echo -e "${Error} Snell Server 启动失败"
+        echo -e "${Tip} 请检查配置文件、端口占用和防火墙规则"
+        command -v journalctl >/dev/null 2>&1 && journalctl -u snell-server -n 20 --no-pager || rc-service snell-server status
+        sleep 2
+        return 1
+    fi
+    if shadowTLSConfigured; then
+        setupShadowTLSService >/dev/null 2>&1 || true
+        shadowSvc start >/dev/null 2>&1 || shadowSvc restart >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+# 停止 Snell
+stopSnell(){
+	checkInstalledStatus || return 1
+	checkStatus
+	if [ "$status" != "running" ]; then
+		echo -e "${Error} Snell Server 没有运行，请检查！"
+		sleep 2
+		startMenu
+		return 1
+	fi
+	shadowTLSConfigured && shadowSvc stop >/dev/null 2>&1 || true
+	if ! svc stop; then
+		echo -e "${Error} Snell Server 停止命令失败"
+		sleep 2
+		startMenu
+		return 1
+	fi
+	echo -e "${Info} Snell Server 已停止"
+    sleep 2
+    startMenu
+}
+
+# 重启 Snell
+restartSnell(){
+	checkInstalledStatus || return 1
+	if ! svc restart; then
+		echo -e "${Error} Snell Server 重启命令失败"
+		sleep 2
+		startMenu
+		return 1
+	fi
+	waitServiceStart
+	if [ "$status" != "running" ]; then
+		echo -e "${Error} Snell Server 重启后未运行"
+		command -v journalctl >/dev/null 2>&1 && journalctl -u snell-server -n 20 --no-pager || rc-service snell-server status
+	else
+        if shadowTLSConfigured; then
+            setupShadowTLSService >/dev/null 2>&1 || true
+            shadowSvc restart >/dev/null 2>&1 || shadowSvc start >/dev/null 2>&1 || true
+        fi
+		echo -e "${Info} Snell Server 已重启"
+	fi
+    sleep 2
+    startMenu
+}
+
+# Snell v5 更新到 Snell v6
+updateV5toV6(){
+	checkInstalledStatus || return 1
+	readConfig || return 1
+
+	if [ "$ver" != "5" ]; then
+		echo -e "${Error} 当前版本不是 Snell v5，无法使用此功能！当前版本：Snell v${ver}"
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	echo -e "${Tip} 即将将 Snell Server 从 ${Yellow_font_prefix}Snell v5${Font_color_suffix} 升级到 ${Green_font_prefix}Snell v6${Font_color_suffix}"
+	echo -e "${Tip} 升级将保留现有端口/密钥配置，并新增 v6 专属设置（DNS IP 偏好、混淆模式）"
+	readInput " 确认升级？(y/N)（默认 n）: "
+	confirm="$REPLY"
+	[ -z "${confirm}" ] && confirm="n"
+
+	if [ "$confirm" != Y ] && [ "$confirm" != y ]; then
+		startMenu
+		return 0
+	fi
+
+	local was_running=false
+	checkStatus
+	[ "$status" = "running" ] && was_running=true
+	if [ "$was_running" = true ] && ! svc stop; then
+		echo -e "${Error} 无法停止当前 Snell Server，取消升级"
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	target_v6_version=$(pickVersion "6")
+
+	if [ -z "$target_v6_version" ]; then
+		echo -e "${Error} 无法找到 Snell v6 下载版本"
+		[ "$was_running" = true ] && svc start >/dev/null 2>&1
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	if ! downloadSnell "${target_v6_version}" "Snell v6 版本"; then
+		echo -e "${Error} Snell v6 下载失败，保持 Snell v5 版本"
+		[ "$was_running" = true ] && svc start >/dev/null 2>&1
+		sleep 2
+		startMenu
+		return 1
+	fi
+	actual_version=$(sed 's/^v//' "${snell_version_file}" 2>/dev/null)
+	if ! echo "$actual_version" | grep -q '^6\.'; then
+		echo -e "${Error} 下载结果不是 Snell v6，请重新安装"
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	ver=6
+	# listen 保持 ::0:port 双栈格式（v5/v6 通用），无需重建
+	setDNSIPPref
+	setMode
+	checkPskForV6
+	if ! writeConfig; then
+		echo -e "${Error} v6 配置写入失败"
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	if [ "$was_running" = true ]; then
+		if ! svc start; then
+			status="stopped"
+		else
+			waitServiceStart
+		fi
+		if [ "$status" != "running" ]; then
+			echo -e "${Error} 升级后服务启动失败，以下为错误日志："
+			command -v journalctl >/dev/null 2>&1 && journalctl -u snell-server -n 20 --no-pager || rc-service snell-server status
+		else
+			echo -e "${Info} Snell Server 已升级到 v6"
+		fi
+	else
+		echo -e "${Info} Snell Server 已升级到 v6，服务保持停止状态"
+	fi
+
+	sleep 2
+	startMenu
+}
+# 更新 Snell Server
+updateSnellServer(){
+    checkInstalledStatus || return 1
+    readConfig || return 1
+    checkVersionUpdate
+
+    if [ "$update_available" != true ]; then
+        if [ "$current_installed_version" = "unknown" ]; then
+            echo -e "${Tip} 无法识别当前 Snell 版本，已跳过更新检查"
+        elif [ -n "$current_installed_version" ]; then
+            echo -e "${Info} 当前已是最新版本：v${current_installed_version}"
+        else
+            echo -e "${Info} 当前已是最新版本"
+        fi
+        sleep 2
+        startMenu
+        return 0
+    fi
+
+    echo -e "${Tip} 发现更新：v${current_installed_version} → v${latest_available_version}"
+    readInput "确认更新？(Y/n，默认 y)："
+    confirm="$REPLY"
+    [ -z "$confirm" ] && confirm="y"
+    case "$confirm" in
+        [Nn]) startMenu; return 0 ;;
+        [Yy]) ;;
+        *) echo -e "${Error} 请输入 y 或 n"; sleep 2; startMenu; return 1 ;;
+    esac
+
+    local was_running=false
+    checkStatus
+    [ "$status" = "running" ] && was_running=true
+
+    if [ "$was_running" = true ] && ! svc stop; then
+        echo -e "${Error} 无法停止当前服务，取消更新"
+        sleep 2
+        startMenu
+        return 1
+    fi
+
+    if ! downloadSnell "${latest_available_version}" "Snell v6 最新版"; then
+        echo -e "${Error} 更新下载失败，已保留当前版本"
+        [ "$was_running" = true ] && svc start >/dev/null 2>&1
+        sleep 2
+        startMenu
+        return 1
+    fi
+
+    if [ "$was_running" != true ]; then
+        echo -e "${Info} 更新完成，服务保持停止状态"
+        sleep 2
+        startMenu
+        return 0
+    fi
+
+    if ! svc start; then
+        status="stopped"
+    else
+        waitServiceStart
+    fi
+
+    if [ "$status" = "running" ]; then
+        actual_version=$(sed 's/^v//' "${snell_version_file}")
+        [ "$actual_version" != "$latest_available_version" ] && echo -e "${Tip} 当前运行版本：v${actual_version}"
+    else
+        echo -e "${Error} 更新后服务启动失败，以下为错误日志："
+        command -v journalctl >/dev/null 2>&1 && journalctl -u snell-server -n 20 --no-pager || rc-service snell-server status
+    fi
+
+    sleep 2
+    startMenu
+}
+# 自动获取 Snell 最新版本号（会话级缓存：一次脚本运行只抓取一次 release notes 页面）
+# 收集页面中所有版本引用并取最大者，避免 head -1 命中历史版本引用
+getLatestVersionFromWeb(){
+    local version_type=$1
+    local release_page="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell"
+
+    # 首次调用时抓取页面并缓存到会话变量
+    if [ -z "$_snell_release_page" ]; then
+        _snell_release_page=$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 10 "$release_page" 2>/dev/null)
+    fi
+
+    local page_content="$_snell_release_page"
+    if [ -z "$page_content" ]; then
+        return 1
+    fi
+
+    local pattern
+    if [ "$version_type" = "v5" ]; then
+        pattern="snell-server-v5\.[0-9]+\.[0-9]+[a-z]*[0-9]*-linux"
+    elif [ "$version_type" = "v6" ]; then
+        pattern="snell-server-v6\.[0-9]+\.[0-9]+[a-z]*[0-9]*-linux"
+    fi
+
+    local best_ver=""
+    local v
+    for v in $(echo "$page_content" | grep -oE "$pattern" | sed 's/snell-server-v//g' | sed 's/-linux//g' | sort -u); do
+        if [ -z "$best_ver" ]; then
+            best_ver="$v"
+        elif compareVersions "$v" "$best_ver"; then
+            best_ver="$v"
+        fi
+    done
+    if [ -n "$best_ver" ]; then
+        echo "$best_ver"
+        return 0
+    fi
+
+    return 1
+}
+
+# 卸载 Snell
+uninstallSnell(){
+	# 未安装时软提示回菜单（不直接退出）
+	if [ ! -e "${snell_bin}" ]; then
+		echo -e "${Error} Snell Server 没有安装！"
+		sleep 2
+		startMenu
+		return 1
+	fi
+
+	local full_ver=$(sed 's/^v//' ${snell_version_file} 2>/dev/null)
+	echo -e "${Error} 即将卸载 Snell Server："
+	echo -e "  - 版本：${Yellow_font_prefix}v${full_ver:-?}${Font_color_suffix}"
+	echo -e "  - 将移除：主程序、服务、配置文件（/etc/snell）"
+	echo
+
+	# 确认循环：非法输入重新询问
+	while true; do
+		readInput " 确认卸载？(y/N)（默认 n）: "
+		unyn="$REPLY"
+		[ -z "${unyn}" ] && unyn="n"
+		case "$unyn" in
+			[Yy]) break ;;
+			[Nn]) echo && echo "卸载已取消" && sleep 2 && startMenu && return 0 ;;
+			*) echo -e "${Error} 请输入 y 或 n" ;;
+		esac
+	done
+
+	echo -e "${Info} 停止并禁用服务"
+	checkStatus
+	if [ "$status" = "running" ]; then
+		if ! svc stop; then
+			echo -e "${Error} 无法停止 Snell Server，取消卸载"
+			sleep 2
+			startMenu
+			return 1
+		fi
+	fi
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl disable snell-server 2>/dev/null
+	else
+		rc-update del snell-server default 2>/dev/null
+	fi
+
+	# 服务脚本已按 PID 停止，兜底匹配 Snell 进程（含 musl loader 场景）
+	pkill -f '[s]nell-server' 2>/dev/null
+
+	if shadowTLSConfigured || [ -e "${shadowtls_bin}" ]; then
+		echo -e "${Info} 同时移除 ShadowTLS"
+		removeShadowTLSArtifacts
+	fi
+
+	echo -e "${Info} 移除主程序"
+	rm -rf "${snell_bin}"
+
+	echo -e "${Info} 移除服务文件"
+	rm -f /etc/systemd/system/snell-server.service /etc/init.d/snell-server
+	command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1
+
+	echo -e "${Info} 移除配置文件及版本记录"
+	rm -rf /etc/snell
+
+	echo -e "${Info} 清理运行时文件"
+	rm -f /run/snell-server.pid /var/log/snell-server.log
+
+	echo && echo -e "${Green_font_prefix}Snell Server 卸载完成！${Font_color_suffix}" && echo
+	sleep 2
+    startMenu
+}
+# 获取 IPv4 地址（多源容错，串行最坏 15s）
+getIpv4(){
+	for src in https://ipinfo.io/ip https://api.ip.sb/ip https://members.3322.org/dyndns/getip; do
+		ipv4=$(curl -fsSL4 --connect-timeout 2 --max-time 5 "$src" 2>/dev/null)
+		[ -n "$ipv4" ] && return 0
+	done
+	ipv4="IPv4_Error"
+}
+
+# 获取 IPv6 地址
+getIpv6(){
+	ip6=$(curl -fsSL6 --connect-timeout 2 --max-time 5 https://ifconfig.co 2>/dev/null)
+	[ -z "$ip6" ] && ip6="IPv6_Error"
+}
+
+# 查看配置信息
+viewConfig(){
+    checkInstalledStatus || return 1
+    readConfig || return 1
+    local ip_tmp_dir
+    ip_tmp_dir=$(mktemp -d /tmp/snell-view.XXXXXX)
+    if [ -n "$ip_tmp_dir" ]; then
+        ( getIpv4; printf '%s\n' "$ipv4" > "${ip_tmp_dir}/ipv4" ) &
+        ( getIpv6; printf '%s\n' "$ip6" > "${ip_tmp_dir}/ipv6" ) &
+        wait
+        ipv4=$(cat "${ip_tmp_dir}/ipv4" 2>/dev/null)
+        ip6=$(cat "${ip_tmp_dir}/ipv6" 2>/dev/null)
+        rm -rf "$ip_tmp_dir"
+    else
+        ipv4="IPv4_Error"
+        ip6="IPv6_Error"
+    fi
+
+    simpleHeader
+    echo
+    echo "配置"
+    if [ "${ipv4}" != "IPv4_Error" ]; then
+        address="$ipv4"
+    elif [ "${ip6}" != "IPv6_Error" ]; then
+        address="[${ip6}]"
+    else
+        address="获取失败"
+    fi
+    echo "配置文件  : ${snell_conf}"
+    echo "IPv4 地址 : ${address}"
+    echo "端口      : ${port}"
+    echo "密钥      : ${psk}"
+    echo "版本      : v${ver}"
+    echo "TFO       : ${tfo}"
+    if [ "$ver" != "6" ]; then
+        echo "OBFS      : ${obfs}"
+        [ "$obfs" != "off" ] && [ -n "$host" ] && echo "域名      : ${host}"
+        echo "IPv6      : ${ipv6}"
+    else
+        echo "DNS IP    : ${dns_ip_pref}"
+        echo "模式      : ${mode}"
+    fi
+    [ -n "$egress_interface" ] && echo "出口网卡  : ${egress_interface}"
+    if shadowTLSConfigured && readShadowTLSConfig; then
+        echo "ShadowTLS : v3"
+        echo "STLS 端口 : ${stls_port}"
+        echo "STLS SNI  : ${stls_sni}"
+    fi
+
+    echo
+    echo "Surge 配置："
+    if [ "${ipv4}" != "IPv4_Error" ]; then
+        printSurgeLine "$ipv4"
+    elif [ "${ip6}" != "IPv6_Error" ]; then
+        printSurgeLine "[${ip6}]"
+    else
+        echo -e "${Error} 无法获取 IP 地址！"
+    fi
+    pauseMenu
+}
+
+# 输出 Surge 客户端配置行（v6 带 mode 参数，v5+obfs 带 obfs 参数）
+printSurgeLine(){
+    local addr=$1
+    local out_port="$port"
+    local stls_extra=""
+    if shadowTLSConfigured && readShadowTLSConfig; then
+        out_port="$stls_port"
+        stls_extra=", shadow-tls-password=${stls_password}, shadow-tls-version=3, shadow-tls-sni=${stls_sni}"
+    fi
+    if [ "${ver}" = "6" ]; then
+        if [ -n "${mode}" ]; then
+            echo "$(uname -n) = snell, ${addr}, ${out_port}, psk=${psk}, version=${ver}, mode=${mode}, reuse=true, tfo=${tfo}${stls_extra}"
+        else
+            echo "$(uname -n) = snell, ${addr}, ${out_port}, psk=${psk}, version=${ver}, reuse=true, tfo=${tfo}${stls_extra}"
+        fi
+    elif [ "${obfs}" != "off" ]; then
+        echo "$(uname -n) = snell, ${addr}, ${out_port}, psk=${psk}, version=${ver}, obfs=${obfs}, obfs-host=${host}, reuse=true, tfo=${tfo}${stls_extra}"
+    else
+        echo "$(uname -n) = snell, ${addr}, ${out_port}, psk=${psk}, version=${ver}, reuse=true, tfo=${tfo}${stls_extra}"
+    fi
+}
+
+# 查看运行状态
+viewStatus(){
+	checkInstalledStatus || return 1
+	readConfig || return 1
+	simpleHeader
+	echo
+	echo "状态"
+	local full_ver=$(sed 's/^v//' "${snell_version_file}" 2>/dev/null)
+	[ -z "$full_ver" ] && full_ver=$(confVersion)
+	echo "版本      : v${full_ver}"
+	echo "配置文件  : ${snell_conf}"
+	echo "监听端口  : ${port}"
+
+	checkStatus
+	if [ "$status" = "running" ]; then
+		echo "服务状态  : 运行中"
+		local pid=""
+		[ -f /run/snell-server.pid ] && pid=$(cat /run/snell-server.pid 2>/dev/null)
+		[ -z "$pid" ] && pid=$(pgrep -f "snell-server -c" 2>/dev/null | head -1)
+		[ -n "$pid" ] && echo "进程 PID  : ${pid}"
+		local start_time
+		start_time=$(ps -o lstart= -p "$pid" 2>/dev/null)
+		[ -z "$start_time" ] && start_time=$(ps -o pid=,etime= 2>/dev/null | awk -v p="$pid" '$1==p{print $2}' | head -1)
+		[ -n "$start_time" ] && echo "启动时间  : ${start_time}"
+		if ss -tln | grep -q ":$port "; then
+			echo "TCP   : 正常"
+		else
+			echo "TCP   : 异常"
+		fi
+		ss -uln | grep -q ":$port " && echo "UDP   : 正常"
+        if shadowTLSConfigured && readShadowTLSConfig; then
+            checkShadowTLSStatus
+            echo "ShadowTLS : ${stls_status} (:${stls_port})"
+        fi
+	else
+		echo "服务  : 未运行"
+		ss -tuln | grep -q ":$port " && echo "端口  : 被其他程序占用"
+	fi
+
+	echo
+	if command -v journalctl >/dev/null 2>&1; then
+		echo "日志  : journalctl -u snell-server -n 50"
+	else
+		echo "日志  : tail -50 /var/log/snell-server.log"
+	fi
+	pauseMenu
+}
+
+# 主菜单
+startMenu(){
+    [ "${menu_active:-false}" = true ] && return 0
+    menu_active=true
+    while true; do
+        simpleHeader
+        echo
+        echo ' 1) 安装服务    2) 启动服务'
+        echo ' 3) 停止服务    4) 重启服务'
+        echo ' 5) 设置配置    6) 查看配置'
+        echo ' 7) 查看状态    8) 更新服务'
+        echo ' 9) 卸载服务   10) ShadowTLS'
+        echo ' 0) 退出脚本'
+        echo
+        readInput ""
+        num="$REPLY"
+
+        case "$num" in
+            0) echo -e "${Info} 已退出脚本，再见！"; exit 0 ;;
+            1) installSnell ;;
+            2) startSnell ;;
+            3) stopSnell ;;
+            4) restartSnell ;;
+            5) setConfig ;;
+            6) viewConfig ;;
+            7) viewStatus ;;
+            8)
+                if [ -e "${snell_bin}" ] && [ -e "${snell_conf}" ]; then
+                    case "$(confVersion)" in
+                        5) updateV5toV6 ;;
+                        6) updateSnellServer ;;
+                        *) echo -e "${Error} 配置文件版本未知，请检查 ${snell_conf}"; sleep 2 ;;
+                    esac
+                else
+                    echo -e "${Error} 请先安装 Snell Server"
+                    sleep 2
+                fi
+                ;;
+            9) uninstallSnell ;;
+            10) shadowTLSMenu ;;
+            *)
+                echo -e "${Error} 输入无效，请输入 0-10 之间的数字"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+# 启动前置检查（一次性执行，不随菜单循环重复）
+checkRoot
+checkSys
+sysArch || exit 1
+
+startMenu

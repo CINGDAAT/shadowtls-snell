@@ -12,6 +12,8 @@ readonly LOG_DIR="/var/log/${APP_NAME}"
 readonly META_FILE="${CONFIG_DIR}/meta"
 readonly SURGE_BASE_URL="https://dl.nssurge.com/snell"
 readonly SURGE_V5_VERSION="${SNELL_V5_VERSION:-v5.0.1}"
+# Current official v6 release candidate. v6 prereleases may be wire-incompatible,
+# so the Surge client must also be kept current. Advanced users can override it.
 readonly SURGE_V6_VERSION="${SNELL_V6_VERSION:-v6.0.0rc2}"
 readonly SHADOWTLS_API="https://api.github.com/repos/ihciah/shadow-tls/releases/latest"
 
@@ -354,7 +356,7 @@ configure_v6() {
     case "$mode" in default|unshaped) break ;; unsafe-raw) warn "unsafe-raw 为明文，仅限可信隧道。"; yes_no "确认使用？" n && break ;; *) warn "无效模式。" ;; esac
   done
   while true; do
-    dns_pref=$(prompt "DNS 偏好（default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only）" "default")
+    dns_pref=$(prompt "DNS 偏好（default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only）" "ipv4-only")
     case "$dns_pref" in default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only) break ;; *) warn "无效 DNS 偏好。" ;; esac
   done
   dns_servers=$(prompt "自定义 DNS（逗号分隔，留空使用系统 DNS）" "")
@@ -392,23 +394,31 @@ public_ip() {
 }
 
 show_info() {
-  local ip v5_psk v5_port stls sni stls_pass v6_psk v6_port v6_mode
+  local ip v5_psk v5_port stls sni stls_pass v6_psk v6_port v6_mode v5_version v6_version v6_extra
   ip=$(public_ip); v5_psk=$(get_meta v5_psk); v5_port=$(get_meta v5_port); stls=$(get_meta v5_shadowtls)
   sni=$(get_meta shadowtls_sni); stls_pass=$(get_meta shadowtls_password)
   v6_psk=$(get_meta v6_psk); v6_port=$(get_meta v6_port); v6_mode=$(get_meta v6_mode)
+  v5_version=$(get_meta v5_version); v6_version=$(get_meta v6_version)
   header "客户端参数"
   if [[ -n "$v5_psk" ]]; then
-    printf 'Snell v5:\n  server: %s:%s\n  psk: %s\n  version: 5\n  obfs: off\n' "$ip" "$v5_port" "$v5_psk"
+    printf 'Snell v5（服务端 %s）:\n  server: %s:%s\n  psk: %s\n  version: 5\n  obfs: off\n' "${v5_version:-$SURGE_V5_VERSION}" "$ip" "$v5_port" "$v5_psk"
     if [[ "$stls" == "yes" ]]; then
-      printf '  ShadowTLS: v3\n  ShadowTLS SNI: %s\n  ShadowTLS password: %s\n  提示: ShadowTLS 是 TCP 前置层，客户端请关闭 Snell QUIC（block-quic=true）。\n' "$sni" "$stls_pass"
+      printf '  ShadowTLS: v3\n  ShadowTLS SNI: %s\n  ShadowTLS password: %s\n  提示: ShadowTLS 是 TCP 前置层，客户端请关闭 Snell QUIC（block-quic=on）。\n' "$sni" "$stls_pass"
+      printf '\n[Surge 可直接复制]\nSnell-v5-STLS = snell, %s, %s, psk=%s, version=5, reuse=true, tfo=false, block-quic=on, shadow-tls-password=%s, shadow-tls-version=3, shadow-tls-sni=%s\n' \
+        "$ip" "$v5_port" "$v5_psk" "$stls_pass" "$sni"
     else
-      printf '  Surge: snell-v5 = snell, %s, %s, psk=%s, version=5\n' "$ip" "$v5_port" "$v5_psk"
+      printf '\n[Surge 可直接复制]\nSnell-v5 = snell, %s, %s, psk=%s, version=5, reuse=true, tfo=false\n' "$ip" "$v5_port" "$v5_psk"
     fi
     printf '\n'
   fi
   if [[ -n "$v6_psk" ]]; then
-    printf 'Snell v6:\n  server: %s:%s\n  psk: %s\n  version: 6\n  mode: %s\n' "$ip" "$v6_port" "$v6_psk" "${v6_mode:-default}"
-    printf '  Surge: snell-v6 = snell, %s, %s, psk=%s, version=6, mode=%s\n\n' "$ip" "$v6_port" "$v6_psk" "${v6_mode:-default}"
+    v6_extra=""
+    [[ -n "$v6_mode" && "$v6_mode" != "default" ]] && v6_extra=", mode=${v6_mode}"
+    printf 'Snell v6（服务端 %s）:\n  server: %s:%s\n  psk: %s\n  version: 6\n  mode: %s\n' \
+      "${v6_version:-$SURGE_V6_VERSION}" "$ip" "$v6_port" "$v6_psk" "${v6_mode:-default}"
+    printf '\n[Surge 可直接复制]\nSnell-v6 = snell, %s, %s, psk=%s, version=6%s, tfo=false\n\n' \
+      "$ip" "$v6_port" "$v6_psk" "$v6_extra"
+    warn "Snell v6 客户端与服务端必须同步兼容；服务端为 ${SURGE_V6_VERSION}，请使用最新版 Surge。"
   fi
   warn "请只放行对外端口；不要放行 v5 的回环端口。"
 }
@@ -491,6 +501,7 @@ usage() {
 
 无参数时进入交互菜单。install 表示交互式同时安装 v5 和 v6。
 可通过环境变量 SNELL_V5_VERSION / SNELL_V6_VERSION 临时覆盖下载版本。
+Snell v6 默认安装当前 v6.0.0rc2；请确保 Surge 客户端也已更新到兼容版本。
 EOF
 }
 

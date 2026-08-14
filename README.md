@@ -1,1 +1,1 @@
-bash <(curl -fsSL https://raw.githubusercontent.com/CINGDAAT/snell-manager/main/snell-manager.sh)
+curl -fsSL https://raw.githubusercontent.com/da/snell/main/snell-stack-manager.sh -o /tmp/snell.sh && sudo bash /tmp/snell.sh

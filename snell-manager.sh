@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# BUILD_ID=20260817-1921-cachebust
 set -uo pipefail
 
-#  Surge Snell manager with:
+# OpenSnell / Surge Snell manager with:
 # - Snell v5 + ShadowTLS v3 wrapping
 # - systemd + Alpine/OpenRC support
 # - persistent `snell` management shortcut
@@ -33,17 +32,6 @@ SHADOWTLS_REPO="ihciah/shadow-tls"
 
 MANAGER_BIN="/usr/local/libexec/snell-manager"
 SHORTCUT_BIN="/usr/local/bin/snell"
-
-# GitHub deployment source for this manager itself.
-# Before publishing, set SNELL_MANAGER_GITHUB_REPO_DEFAULT to your own repo,
-# e.g. "yourname/opensnell-manager". Users can also override it at runtime.
-SNELL_MANAGER_GITHUB_REPO_DEFAULT="CINGDAAT/snell-manager"
-SNELL_MANAGER_GITHUB_BRANCH_DEFAULT="main"
-SNELL_MANAGER_GITHUB_PATH_DEFAULT="snell-manager-shadowtls-alpine.sh"
-SNELL_MANAGER_GITHUB_REPO="${SNELL_MANAGER_GITHUB_REPO:-$SNELL_MANAGER_GITHUB_REPO_DEFAULT}"
-SNELL_MANAGER_GITHUB_BRANCH="${SNELL_MANAGER_GITHUB_BRANCH:-$SNELL_MANAGER_GITHUB_BRANCH_DEFAULT}"
-SNELL_MANAGER_GITHUB_PATH="${SNELL_MANAGER_GITHUB_PATH:-$SNELL_MANAGER_GITHUB_PATH_DEFAULT}"
-SNELL_MANAGER_RAW_URL="${SNELL_MANAGER_RAW_URL:-}"
 
 OPENSNELL_REPO="missuo/opensnell"
 OPENSNELL_RELEASE_API="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
@@ -213,70 +201,17 @@ meta_set_many() {
     chmod 600 "$META_FILE"
 }
 
-manager_raw_url() {
-    local saved=""
-    [ -f "$META_FILE" ] && saved=$(meta_get manager_raw_url)
-    if [ -n "$SNELL_MANAGER_RAW_URL" ]; then
-        printf '%s\n' "$SNELL_MANAGER_RAW_URL"
-    elif [ -n "$saved" ]; then
-        printf '%s\n' "$saved"
-    elif [ -n "$SNELL_MANAGER_GITHUB_REPO" ]; then
-        printf 'https://raw.githubusercontent.com/%s/%s/%s\n' \
-            "$SNELL_MANAGER_GITHUB_REPO" "$SNELL_MANAGER_GITHUB_BRANCH" "$SNELL_MANAGER_GITHUB_PATH"
-    fi
-}
-
-validate_github_raw_url() {
-    local url="$1"
-    case "$url" in
-        https://raw.githubusercontent.com/*|https://github.com/*/raw/*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-remember_manager_source() {
-    local url
-    url=$(manager_raw_url)
-    [ -n "$url" ] || return 0
-    if validate_github_raw_url "$url"; then
-        meta_set_many "manager_raw_url=$url"
-    fi
-}
-
 install_shortcut() {
     mkdir -p "$(dirname "$MANAGER_BIN")"
     local src="${BASH_SOURCE[0]}"
-    local src_real="" dst_real="" url="" tmp=""
+    local src_real="" dst_real=""
     src_real=$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")
     dst_real=$(readlink -f "$MANAGER_BIN" 2>/dev/null || printf '%s' "$MANAGER_BIN")
-
-    if [ "$src_real" != "$dst_real" ] && [ -r "$src" ] && [ -f "$src" ]; then
+    if [ "$src_real" != "$dst_real" ] && [ -r "$src" ]; then
         cp "$src" "$MANAGER_BIN"
         chmod 0755 "$MANAGER_BIN"
-    elif [ ! -x "$MANAGER_BIN" ]; then
-        # `curl ... | bash` has no regular source file to copy. Fetch the
-        # manager again from its configured GitHub Raw URL so the `snell`
-        # command remains available after this process exits.
-        url=$(manager_raw_url)
-        if [ -n "$url" ] && validate_github_raw_url "$url"; then
-            tmp=$(mktemp)
-            if curl -fsSL --retry 3 --connect-timeout 10 -o "$tmp" "$url" && bash -n "$tmp"; then
-                install -m 0755 "$tmp" "$MANAGER_BIN"
-            else
-                rm -f "$tmp"
-                print_error "Could not persist the manager from GitHub: $url"
-                return 1
-            fi
-            rm -f "$tmp"
-        else
-            print_error "Cannot persist the 'snell' shortcut when running from stdin."
-            print_info "Publish with SNELL_MANAGER_GITHUB_REPO_DEFAULT set, or use bash <(curl -fsSL RAW_URL)."
-            return 1
-        fi
     fi
-
     ln -sfn "$MANAGER_BIN" "$SHORTCUT_BIN"
-    remember_manager_source
     print_success "Management shortcut installed: run 'snell' anytime"
 }
 
@@ -784,120 +719,6 @@ do_update() {
     print_success "Update complete"
 }
 
-show_github_deploy() {
-    local url repo branch path
-    url=$(manager_raw_url)
-    repo="$SNELL_MANAGER_GITHUB_REPO"
-    branch="$SNELL_MANAGER_GITHUB_BRANCH"
-    path="$SNELL_MANAGER_GITHUB_PATH"
-
-    print_header "GitHub Quick Deploy"
-    if [ -z "$url" ]; then
-        print_warning "GitHub source is not configured yet."
-        echo "Set one of these before publishing the script:"
-        echo "  SNELL_MANAGER_GITHUB_REPO_DEFAULT=\"yourname/yourrepo\""
-        echo "or run: snell github-config"
-        return 1
-    fi
-
-    echo -e "${BOLD}Raw URL:${NC} $url"
-    [ -n "$repo" ] && echo -e "${BOLD}Repository:${NC} ${repo} (${branch}:${path})"
-    echo
-    echo -e "${BOLD}Debian / Ubuntu / RHEL / existing Bash:${NC}"
-    echo "  bash <(curl -fsSL '$url') install"
-    echo
-    echo -e "${BOLD}Pipe form:${NC}"
-    echo "  curl -fsSL '$url' | bash -s -- install"
-    echo
-    echo -e "${BOLD}Alpine minimal image:${NC}"
-    echo "  apk add --no-cache bash curl ca-certificates && bash <(curl -fsSL '$url') install"
-    echo
-    echo -e "${BOLD}Manager self-update:${NC}"
-    echo "  snell self-update"
-}
-
-do_github_config() {
-    check_root
-    local current repo branch path url choice
-    current=$(manager_raw_url)
-    print_header "Configure GitHub Deployment Source"
-    if [ -n "$current" ]; then
-        print_info "Current source: $current"
-    fi
-
-    choice=$(prompt_default "Configure by repo (repo) or full raw URL (url)" "repo")
-    case "$choice" in
-        repo)
-            repo=$(prompt_default "GitHub repository (owner/repo)" "$SNELL_MANAGER_GITHUB_REPO")
-            if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-                print_error "Invalid GitHub repository. Expected owner/repo."
-                return 1
-            fi
-            branch=$(prompt_default "Branch" "$SNELL_MANAGER_GITHUB_BRANCH")
-            path=$(prompt_default "Script path in repository" "$SNELL_MANAGER_GITHUB_PATH")
-            url="https://raw.githubusercontent.com/${repo}/${branch}/${path}"
-            ;;
-        url)
-            url=$(prompt_default "Full GitHub raw URL" "$current")
-            if ! validate_github_raw_url "$url"; then
-                print_error "Only GitHub raw URLs are accepted."
-                return 1
-            fi
-            ;;
-        *)
-            print_error "Choose repo or url"
-            return 1
-            ;;
-    esac
-
-    meta_set_many "manager_raw_url=$url"
-    print_success "GitHub deployment source saved"
-    show_github_deploy
-}
-
-do_manager_self_update() {
-    check_root; detect_os; ensure_tools
-    local url tmp backup
-    url=$(manager_raw_url)
-    if [ -z "$url" ]; then
-        print_error "GitHub deployment source is not configured."
-        print_info "Run: snell github-config"
-        return 1
-    fi
-    if ! validate_github_raw_url "$url"; then
-        print_error "Refusing non-GitHub manager source: $url"
-        return 1
-    fi
-
-    print_header "Updating Snell Manager from GitHub"
-    print_info "Source: $url"
-    tmp=$(mktemp)
-    backup="${MANAGER_BIN}.bak"
-    if ! curl -fL --retry 3 --connect-timeout 10 -o "$tmp" "$url"; then
-        rm -f "$tmp"
-        print_error "Failed to download manager script"
-        return 1
-    fi
-    if ! bash -n "$tmp"; then
-        rm -f "$tmp"
-        print_error "Downloaded manager failed bash syntax validation"
-        return 1
-    fi
-    if ! grep -q 'Snell + ShadowTLS Management Menu' "$tmp"; then
-        rm -f "$tmp"
-        print_error "Downloaded file does not look like this Snell manager"
-        return 1
-    fi
-
-    [ -f "$MANAGER_BIN" ] && cp -f "$MANAGER_BIN" "$backup"
-    install -m 0755 "$tmp" "$MANAGER_BIN"
-    rm -f "$tmp"
-    ln -sfn "$MANAGER_BIN" "$SHORTCUT_BIN"
-    meta_set_many "manager_raw_url=$url"
-    print_success "Manager updated from GitHub"
-    [ -f "$backup" ] && print_info "Previous manager backup: $backup"
-}
-
 do_uninstall() {
     check_root; detect_os; detect_init
     local confirm rm_cfg
@@ -935,9 +756,6 @@ Commands:
   disable        Disable boot auto-start
   status         Show service status
   info           Show connection/client configuration
-  github         Show GitHub one-line deployment commands
-  github-config  Configure GitHub repo/raw source for deployment
-  self-update    Update this manager script from configured GitHub source
   help           Show this help
 
 Run `snell` with no arguments to open the interactive menu.
@@ -967,12 +785,10 @@ show_menu() {
         echo -e "${CYAN}9)${NC}  Disable auto-start"
         echo -e "${YELLOW}10)${NC} Status"
         echo -e "${YELLOW}11)${NC} Connection info"
-        echo -e "${CYAN}12)${NC} GitHub quick deploy"
-        echo -e "${CYAN}13)${NC} Update manager from GitHub"
         echo -e "${MAGENTA}0)${NC}  Exit"
         echo
         local choice
-        read -r -p "$(echo -e "${CYAN}Choice (0-13): ${NC}")" choice
+        read -r -p "$(echo -e "${CYAN}Choice (0-11): ${NC}")" choice
         case "$choice" in
             1) do_install; pause_menu ;;
             2) do_reconfigure; pause_menu ;;
@@ -985,16 +801,6 @@ show_menu() {
             9) check_root; disable_stack; pause_menu ;;
             10) status_stack; pause_menu ;;
             11) show_info; pause_menu ;;
-            12)
-                if ! show_github_deploy; then
-                    echo
-                    local cfg
-                    cfg=$(prompt_yesno "Configure GitHub source now" "y")
-                    [ "$cfg" = y ] && do_github_config
-                fi
-                pause_menu
-                ;;
-            13) do_manager_self_update; pause_menu ;;
             0) return ;;
             *) print_error "Invalid option"; sleep 1 ;;
         esac
@@ -1018,9 +824,6 @@ main() {
         disable) check_root; disable_stack ;;
         status) status_stack ;;
         info) show_info ;;
-        github|github-deploy) show_github_deploy ;;
-        github-config) do_github_config ;;
-        self-update|manager-update) do_manager_self_update ;;
         "") show_menu ;;
         *) print_error "Unknown command: $1"; show_help; exit 1 ;;
     esac

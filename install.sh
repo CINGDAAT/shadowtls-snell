@@ -1,9 +1,10 @@
 #!/bin/sh
+# BUILD_ID=20260817-1921-cachebust
 set -eu
 
 # GitHub quick bootstrap for Snell + ShadowTLS manager.
 # Change this ONE value before publishing this file.
-GITHUB_REPO="YOUR_GITHUB_USER/YOUR_REPO"
+GITHUB_REPO="CINGDAAT/snell-manager"
 GITHUB_BRANCH="main"
 MANAGER_PATH="snell-manager-shadowtls-alpine.sh"
 

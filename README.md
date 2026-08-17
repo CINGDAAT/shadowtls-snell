@@ -1,1 +1,1 @@
-curl -fsSL https://raw.githubusercontent.com/CINGDAAT/shadowtls-snell-manager/main/shadowtls-snell-manager.sh -o /tmp/shadowtls.sh && bash /tmp/shadowtls.sh
+curl -fsSL https://raw.githubusercontent.com/CINGDAAT/snell-manager/main/install.sh | sh
